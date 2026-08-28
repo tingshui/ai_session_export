@@ -9,7 +9,7 @@ Export AI coding session transcripts from multiple tools into a unified Markdown
 | OpenCode | `~/.local/share/opencode/opencode.db` |
 | Claude Code | `~/.claude/projects/**/*.jsonl` |
 | Codex | `~/.codex/sessions/**/*.jsonl`, `~/.codex/archived_sessions/*.jsonl` |
-| ChatGPT Projects | Codex App live snapshot on stdin, or an official export directory/zip |
+| ChatGPT | Codex App metadata + planned incremental pages on stdin; legacy full snapshot/Official import remains available for migrations |
 | Google Antigravity 2.0 | `~/.gemini/antigravity/brain/*/.system_generated/logs/transcript_full.jsonl` |
 | Google Antigravity IDE | `~/.gemini/antigravity-ide/brain/*/.system_generated/logs/transcript_full.jsonl` |
 | Google Antigravity CLI | `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl` |
@@ -30,6 +30,10 @@ python export_sessions.py
 python export_sessions.py --source antigravity
 python export_sessions.py --source codex
 python export_sessions.py --source chatgpt --chatgpt-input /path/to/export.zip --chatgpt-project-config /path/to/project-config.json
+python export_chatgpt_incremental.py plan --chatgpt-project-config /path/to/project-config.json < metadata.json
+python export_chatgpt_incremental.py apply --chatgpt-project-config /path/to/project-config.json < planned-pages.json
+python import_chatgpt_legacy.py --chatgpt-project-config /path/to/project-config.json
+python import_chatgpt_legacy.py --chatgpt-project-config /path/to/project-config.json --apply
 python export_sessions.py --source cursor
 python export_sessions.py --source dsh
 
@@ -65,16 +69,30 @@ injections, tolerates torn trailing records (including a truncated final
 Zstandard frame), and rewrites one stable file per growing live session.
 Decompression shells out to the `zstd` binary.
 
-The ChatGPT source is explicitly Project-scoped. It exports only exact Project
-IDs in `--chatgpt-project-config`, accepts either a transient Codex App snapshot
-(`--chatgpt-input -`) or an official OpenAI export directory/zip, and writes one
-stable Markdown file per current conversation branch under
-`chatgpt/<project-label>/`. It never discovers or exports Projectless chats.
-Live snapshots must prove full pagination; official exports are the historical
-reconciliation path. Codex App reads must use its documented per-page limits.
+The production incremental ChatGPT path is two-phase. `plan` accepts cheap
+thread metadata and reports only changed/new thread IDs plus the prior message
+anchor; unchanged threads receive no body read. `apply` accepts newest-first
+pages only for that plan, stops at the exact ID+hash anchor, merges in place,
+verifies Markdown, and advances the checkpoint last. Historical gaps are
+reported separately and are never hidden inside the daily run. Exact Project
+IDs come from the config; an optional explicit `personal.enabled=true` includes
+projectless ChatGPT conversations under the synthetic `personal` scope.
 Incomplete user content fails the conversation without overwriting its prior
 Markdown/state. Assistant-only truncation is retained only in the private
-archive with explicit incomplete metadata and a visible warning marker.
+archive with explicit incomplete metadata and a visible warning marker. The
+legacy full-snapshot/Official path is not part of this daily command.
+
+`import_chatgpt_legacy.py` is a one-time migration for the older emoji-heading
+Markdown archive. It defaults to a metadata-only dry run. `--apply` converts
+each legacy conversation into the checksummed canonical format, creates
+deterministic message IDs, verifies existing Live archives before merging,
+keeps Live content and IDs on duplicate turns, updates exporter state, rebuilds
+Project indexes, and removes the superseded legacy conversation files only
+after the archive and checkpoint have both succeeded. Historical per-turn dates
+were not present in the old format; the importer preserves HH:MM and order while
+marking the synthesized dates as approximate in state. Migrated conversations
+use the downstream `full_history` coverage contract; legacy provenance remains
+in the separate `legacy_import` state object.
 
 ## Output Format
 

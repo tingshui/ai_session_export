@@ -1,5 +1,41 @@
 ## Changelog
 
+### 2026-08-28 — Observer generation handoff
+
+- ChatGPT `apply` now advances a durable `archive_generation` and appends a
+  raw-text-free Observer handoff to exporter state, including the prior
+  generation, run status, changed archive CAS hashes, exact prior message
+  ID/SHA anchor, and exact new user message IDs/SHA hashes.
+- Zero-user-delta runs emit an explicit handoff, allowing the downstream
+  Observer to advance without reopening Markdown. Handoffs retain a bounded
+  generation chain; gaps fail closed into the full-archive recovery path.
+- Normal incremental and backfill archives now record `coverage=full_history`;
+  only deliberately bounded window previews remain `window_preview`.
+
+### 2026-08-28 — One-time legacy ChatGPT Markdown migration
+
+- Added a dry-run-first legacy importer for the old Project-folder Markdown
+  format. It parses emoji user/assistant headings without splitting fenced code,
+  assigns deterministic UUIDv5 message identities and SHA-256 turn markers, and
+  writes only canonical archives that reread successfully.
+- Existing Live archives and checkpoint metadata are validated before planning.
+  When a conversation overlaps, duplicate role+content turns are removed from
+  the legacy tail and the Live message content, IDs, and output path win.
+- Migrated conversations satisfy the downstream `full_history` coverage
+  contract; migration source, Live merge status, and approximate-date quality
+  remain explicit in the separate `legacy_import` provenance object.
+- The apply path updates Markdown, exporter state, and Project indexes as one
+  rollback-capable transaction; old conversation files are deleted only after
+  verified canonical writes and a successful state checkpoint. Synthetic tests
+  cover deterministic parsing, migration, Live precedence, rollback, and exact
+  Project allowlisting.
+
+### 2026-08-28
+
+- Added an optional exclusive `--until-at` bound to ChatGPT window plan/apply,
+  so a local-day replay can use a precise half-open interval instead of also
+  capturing later conversations.
+
 ### 2026-08-27
 
 - Added one-time Official seed authority, cross-process ChatGPT writer locking,
