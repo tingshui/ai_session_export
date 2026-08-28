@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import zipfile
+from collections.abc import Callable
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -47,6 +48,51 @@ def _require_id(value: Any, field: str) -> str:
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _official_input_sha256(source: Path) -> str:
+    digest = hashlib.sha256()
+    if source.is_file():
+        digest.update(source.read_bytes())
+        return digest.hexdigest()
+    if source.is_dir():
+        members = sorted(
+            path
+            for path in source.rglob("*.json")
+            if OFFICIAL_MEMBER_RE.fullmatch(path.name)
+        )
+        for path in members:
+            digest.update(path.relative_to(source).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+        return digest.hexdigest()
+    raise ChatGPTExportError(f"official ChatGPT export not found: {source}")
+
+
+def _official_seed(source_state: dict[str, Any]) -> dict[str, Any]:
+    value = source_state.get("official_seed")
+    if value is None:
+        return {"status": "unused"}
+    if not isinstance(value, dict):
+        raise ChatGPTExportError("invalid ChatGPT official seed state")
+    status = value.get("status")
+    if status not in {"unused", "in_progress", "completed"}:
+        raise ChatGPTExportError("invalid ChatGPT official seed status")
+    return dict(value)
+
+
+def _revision_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return None
+        return None
 
 
 def _epoch_ms(value: Any) -> int | None:
@@ -513,9 +559,44 @@ def export_chatgpt(
     dry_run: bool,
     since_date: date | None,
     stdin_text: str | None = None,
+    checkpoint_state: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     allowlist = load_project_allowlist(project_config)
-    if str(source_input) == "-":
+    is_live = str(source_input) == "-"
+    source_state = state.get("chatgpt", {})
+    existing_sessions = source_state.get("sessions", {})
+    if not isinstance(existing_sessions, dict):
+        raise ChatGPTExportError("invalid ChatGPT exporter state")
+    seed = _official_seed(source_state)
+    official_input_sha256 = None
+    seed_started_at = None
+    if not is_live and not dry_run:
+        if seed["status"] == "completed":
+            raise ChatGPTExportError("Official export writer is permanently closed")
+        official_input_sha256 = _official_input_sha256(source_input)
+        if (
+            seed["status"] == "in_progress"
+            and seed.get("input_sha256") != official_input_sha256
+        ):
+            raise ChatGPTExportError(
+                "Official export seed is already in progress for another input"
+            )
+        seed_started_at = str(
+            seed.get("started_at") or datetime.now(timezone.utc).isoformat()
+        )
+        state["chatgpt"] = {
+            **source_state,
+            "sessions": dict(existing_sessions),
+            "official_seed": {
+                "status": "in_progress",
+                "input_sha256": official_input_sha256,
+                "started_at": seed_started_at,
+            },
+        }
+        if checkpoint_state is not None:
+            checkpoint_state(state)
+
+    if is_live:
         if stdin_text is None:
             raise ChatGPTExportError("live ChatGPT snapshot stdin is empty")
         try:
@@ -527,18 +608,42 @@ def export_chatgpt(
         parsed, ignored, warnings = parse_live_snapshot(payload, allowlist)
         observed_at = str(payload.get("observed_at") or datetime.now(timezone.utc).isoformat())
     else:
-        parsed, ignored, warnings = parse_official_snapshot(
-            load_official_conversations(source_input), allowlist
-        )
+        try:
+            parsed, ignored, warnings = parse_official_snapshot(
+                load_official_conversations(source_input), allowlist
+            )
+        except Exception:
+            if not dry_run:
+                state["chatgpt"] = {
+                    **source_state,
+                    "sessions": dict(existing_sessions),
+                    "official_seed": {"status": "unused"},
+                }
+                if checkpoint_state is not None:
+                    checkpoint_state(state)
+            raise
         observed_at = datetime.now(timezone.utc).isoformat()
 
-    source_state = state.get("chatgpt", {})
-    existing_sessions = source_state.get("sessions", {})
-    if not isinstance(existing_sessions, dict):
-        raise ChatGPTExportError("invalid ChatGPT exporter state")
+    scanned = len(parsed) + len(warnings)
+    if not is_live and warnings and not dry_run:
+        state["chatgpt"] = {
+            **source_state,
+            "sessions": dict(existing_sessions),
+            "official_seed": {"status": "unused"},
+        }
+        if checkpoint_state is not None:
+            checkpoint_state(state)
+        return {
+            "source": "chatgpt",
+            "scanned": scanned,
+            "exported": 0,
+            "failed": len(warnings),
+            "ignored": ignored,
+            "warnings": warnings,
+        }
+
     updated_sessions = dict(existing_sessions)
     exported = 0
-    scanned = len(parsed) + len(warnings)
 
     for conversation in parsed:
         if since_date and date.fromisoformat(conversation.record.date) < since_date:
@@ -546,6 +651,36 @@ def export_chatgpt(
         previous = existing_sessions.get(conversation.record.session_id, {})
         if not isinstance(previous, dict):
             previous = {}
+        previous_kind = previous.get("last_input_kind")
+        if not is_live and previous_kind == "live_snapshot":
+            continue
+        if is_live and previous_kind == "live_snapshot":
+            previous_revision = _revision_number(previous.get("thread_updated_at"))
+            incoming_revision = _revision_number(conversation.thread_updated_at)
+            branch_changed = (
+                previous.get("branch_fingerprint")
+                != conversation.branch_fingerprint
+            )
+            if branch_changed and (
+                previous_revision is None
+                or incoming_revision is None
+                or incoming_revision <= previous_revision
+            ):
+                warnings.append(
+                    {
+                        "thread_id": conversation.record.session_id,
+                        "error": (
+                            "live revision is older than verified archive state"
+                            if (
+                                previous_revision is not None
+                                and incoming_revision is not None
+                                and incoming_revision < previous_revision
+                            )
+                            else "live revision authority is ambiguous"
+                        ),
+                    }
+                )
+                continue
         previous_output = str(previous.get("output_file") or "")
         output_path = output_dir / previous_output if previous_output else None
         output_exists = bool(output_path and output_path.is_file())
@@ -581,7 +716,19 @@ def export_chatgpt(
         exported += 1
 
     if not dry_run:
-        state["chatgpt"] = {**source_state, "sessions": updated_sessions}
+        final_state = {**source_state, "sessions": updated_sessions}
+        if not is_live:
+            final_state["official_seed"] = {
+                "status": "completed",
+                "input_sha256": official_input_sha256,
+                "started_at": seed_started_at,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+        elif "official_seed" in source_state:
+            final_state["official_seed"] = seed
+        state["chatgpt"] = final_state
+        if checkpoint_state is not None:
+            checkpoint_state(state)
 
     return {
         "source": "chatgpt",

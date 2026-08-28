@@ -11,7 +11,10 @@ import pytest
 
 from ai_session_export.archive import parse_marked_markdown
 from ai_session_export import cli as cli_module
+from ai_session_export.cli import run_export
+import ai_session_export.sources.chatgpt as chatgpt_module
 from ai_session_export.sources.chatgpt import ChatGPTExportError, export_chatgpt
+from ai_session_export.state import load_state
 
 
 PROJECT_ID = "g-p-approved"
@@ -193,10 +196,18 @@ def official_conversations(user_text: str = "Synthetic private question") -> lis
     ]
 
 
-def export_live(tmp_path: Path, state: dict, text: str = "Synthetic private question") -> dict:
+def export_live(
+    tmp_path: Path,
+    state: dict,
+    text: str = "Synthetic private question",
+    *,
+    updated_at: int = 1_720_000_100,
+) -> dict:
     config = tmp_path / "routing.json"
     if not config.exists():
         write_config(config)
+    snapshot = live_snapshot(text)
+    snapshot["projects"][0]["threads"][0]["updated_at"] = updated_at
     return export_chatgpt(
         tmp_path / "out",
         state,
@@ -205,7 +216,7 @@ def export_live(tmp_path: Path, state: dict, text: str = "Synthetic private ques
         full=False,
         dry_run=False,
         since_date=None,
-        stdin_text=json.dumps(live_snapshot(text)),
+        stdin_text=json.dumps(snapshot),
     )
 
 
@@ -260,7 +271,12 @@ def test_edit_rewrites_the_stable_markdown_path(tmp_path: Path) -> None:
     export_live(tmp_path, state)
     path = next((tmp_path / "out" / "Approved_Project").glob("*.md"))
 
-    result = export_live(tmp_path, state, "Edited synthetic question")
+    result = export_live(
+        tmp_path,
+        state,
+        "Edited synthetic question",
+        updated_at=1_720_000_101,
+    )
 
     assert result["exported"] == 1
     assert list((tmp_path / "out" / "Approved_Project").glob("*.md")) == [path]
@@ -416,4 +432,168 @@ def test_missing_allowlist_is_a_hard_failure(tmp_path: Path) -> None:
             dry_run=False,
             since_date=None,
             stdin_text=json.dumps(live_snapshot()),
+        )
+
+
+def write_official_zip(path: Path, conversations: list[dict]) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("conversations.json", json.dumps(conversations))
+
+
+def test_successful_official_seed_completes_once_and_later_write_is_rejected(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    source = tmp_path / "export.zip"
+    write_official_zip(source, official_conversations())
+    state = {"chatgpt": {"sessions": {}}}
+
+    result = export_chatgpt(
+        tmp_path / "out",
+        state,
+        source_input=source,
+        project_config=config,
+        full=False,
+        dry_run=False,
+        since_date=None,
+    )
+
+    assert result["exported"] == 1
+    seed = state["chatgpt"]["official_seed"]
+    assert seed["status"] == "completed"
+    assert seed["input_sha256"]
+    assert seed["started_at"]
+    assert seed["completed_at"]
+    with pytest.raises(ChatGPTExportError, match="permanently closed"):
+        export_chatgpt(
+            tmp_path / "out",
+            state,
+            source_input=source,
+            project_config=config,
+            full=False,
+            dry_run=False,
+            since_date=None,
+        )
+
+
+def test_failed_official_seed_writes_nothing_and_returns_to_unused(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    source = tmp_path / "export.zip"
+    broken = official_conversations()
+    broken[0]["mapping"] = "broken"
+    write_official_zip(source, broken)
+    state = {"chatgpt": {"sessions": {}}}
+
+    result = export_chatgpt(
+        tmp_path / "out",
+        state,
+        source_input=source,
+        project_config=config,
+        full=False,
+        dry_run=False,
+        since_date=None,
+    )
+
+    assert result["failed"] == 1
+    assert result["exported"] == 0
+    assert state["chatgpt"]["official_seed"] == {"status": "unused"}
+    assert state["chatgpt"]["sessions"] == {}
+    assert not (tmp_path / "out").exists()
+
+
+def test_official_seed_never_overwrites_a_live_session(tmp_path: Path) -> None:
+    state = {"chatgpt": {"sessions": {}}}
+    export_live(tmp_path, state, "Newer live truth")
+    path = next((tmp_path / "out" / "Approved_Project").glob("*.md"))
+    live_markdown = path.read_bytes()
+    source = tmp_path / "export.zip"
+    write_official_zip(source, official_conversations("Older official text"))
+
+    result = export_chatgpt(
+        tmp_path / "out",
+        state,
+        source_input=source,
+        project_config=tmp_path / "routing.json",
+        full=False,
+        dry_run=False,
+        since_date=None,
+    )
+
+    assert result["exported"] == 0
+    assert path.read_bytes() == live_markdown
+    session = state["chatgpt"]["sessions"]["thread-fixture"]
+    assert session["last_input_kind"] == "live_snapshot"
+    assert state["chatgpt"]["official_seed"]["status"] == "completed"
+
+
+def test_older_live_revision_cannot_overwrite_newer_live_state(tmp_path: Path) -> None:
+    state = {"chatgpt": {"sessions": {}}}
+    export_live(tmp_path, state, "Current live truth")
+    path = next((tmp_path / "out" / "Approved_Project").glob("*.md"))
+    original = path.read_bytes()
+    snapshot = live_snapshot("Stale live text")
+    snapshot["projects"][0]["threads"][0]["updated_at"] = 1_710_000_000
+
+    result = export_chatgpt(
+        tmp_path / "out",
+        state,
+        source_input=Path("-"),
+        project_config=tmp_path / "routing.json",
+        full=False,
+        dry_run=False,
+        since_date=None,
+        stdin_text=json.dumps(snapshot),
+    )
+
+    assert result["failed"] == 1
+    assert result["exported"] == 0
+    assert "older than verified archive state" in result["warnings"][0]["error"]
+    assert path.read_bytes() == original
+
+
+def test_cli_persists_in_progress_before_official_archive_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    source = tmp_path / "export.zip"
+    write_official_zip(source, official_conversations())
+    state_file = tmp_path / "state.json"
+    observed_statuses: list[str] = []
+    original_write = chatgpt_module._atomic_write_text
+
+    def observe_write(path: Path, content: str) -> None:
+        observed_statuses.append(
+            load_state(state_file)["chatgpt"]["official_seed"]["status"]
+        )
+        original_write(path, content)
+
+    monkeypatch.setattr(chatgpt_module, "_atomic_write_text", observe_write)
+
+    result = run_export(
+        "chatgpt",
+        full=False,
+        dry_run=False,
+        base_dir=tmp_path / "archive",
+        state_file=state_file,
+        chatgpt_input=source,
+        chatgpt_project_config=config,
+    )
+
+    assert result[0]["exported"] == 1
+    assert observed_statuses == ["in_progress"]
+    assert load_state(state_file)["chatgpt"]["official_seed"]["status"] == "completed"
+    with pytest.raises(ChatGPTExportError, match="permanently closed"):
+        run_export(
+            "chatgpt",
+            full=False,
+            dry_run=False,
+            base_dir=tmp_path / "archive",
+            state_file=state_file,
+            chatgpt_input=source,
+            chatgpt_project_config=config,
         )

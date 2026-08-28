@@ -11,7 +11,7 @@ DEFAULT_STATE = {
     "opencode": {"last_session_time": 0},
     "claude_code": {"last_timestamp": 0},
     "codex": {"sessions": {}},
-    "chatgpt": {"sessions": {}},
+    "chatgpt": {"sessions": {}, "official_seed": {"status": "unused"}},
     "antigravity": {"last_timestamp": 0, "legacy_cursor_migrated": False, "surfaces": {}},
     "cursor": {"sessions": {}},
     "dsh": {"sessions": {}},

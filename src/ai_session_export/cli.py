@@ -144,6 +144,11 @@ def run_export(
                 dry_run=dry_run,
                 since_date=since_date,
                 stdin_text=chatgpt_stdin_text,
+                checkpoint_state=(
+                    (lambda current: save_state(current, state_file))
+                    if not dry_run and str(chatgpt_input) != "-"
+                    else None
+                ),
             )
         )
     if source in {"cursor", "all"}:

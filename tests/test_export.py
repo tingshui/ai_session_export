@@ -188,6 +188,10 @@ def test_state_defaults() -> None:
         "surfaces": {},
     }
     assert state["codex"] == {"sessions": {}}
+    assert state["chatgpt"] == {
+        "sessions": {},
+        "official_seed": {"status": "unused"},
+    }
 
 
 def test_unique_output_path(tmp_path: Path) -> None:
