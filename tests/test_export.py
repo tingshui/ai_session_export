@@ -167,6 +167,53 @@ def test_state_load_save_roundtrip(tmp_path: Path) -> None:
     }
 
 
+def test_non_chatgpt_writer_waits_for_shared_state_transaction(tmp_path: Path) -> None:
+    state_file = tmp_path / "state.json"
+    save_state({"chatgpt": {"sessions": {}}}, state_file)
+    child_script = f"""
+import sys
+from pathlib import Path
+from ai_session_export.cli import run_export
+print('ready', flush=True)
+run_export(
+    'codex',
+    full=False,
+    dry_run=False,
+    base_dir=Path({str(tmp_path / 'archive')!r}),
+    state_file=Path({str(state_file)!r}),
+    codex_session_dirs=(Path({str(tmp_path / 'missing-sessions')!r}),),
+    codex_session_index=Path({str(tmp_path / 'missing-index.jsonl')!r}),
+)
+"""
+
+    with cli_module._state_write_lock(state_file):
+        process = subprocess.Popen(
+            [sys.executable, "-c", child_script],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "ready"
+        assert process.poll() is None
+        save_state(
+            {
+                "chatgpt": {
+                    "sessions": {
+                        "thread-fixture": {"last_input_kind": "live_snapshot"}
+                    }
+                }
+            },
+            state_file,
+        )
+
+    stdout, stderr = process.communicate(timeout=5)
+    assert process.returncode == 0, (stdout, stderr)
+    assert load_state(state_file)["chatgpt"]["sessions"] == {
+        "thread-fixture": {"last_input_kind": "live_snapshot"}
+    }
+
+
 def test_state_loading_legacy_shape_does_not_mutate_defaults(tmp_path: Path) -> None:
     state_file = tmp_path / ".export_state.json"
     state_file.write_text(json.dumps({"antigravity": {"last_timestamp": 123}}), encoding="utf-8")

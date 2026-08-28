@@ -64,6 +64,48 @@ def test_live_assistant_truncation_is_archived_and_marked_incomplete(
     ]
 
 
+def test_empty_incomplete_assistant_item_is_preserved_with_visible_marker(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    snapshot = live_snapshot("Synthetic question")
+    items = snapshot["projects"][0]["threads"][0]["turns"][0]["items"]
+    items.append(
+        {
+            "type": "agentMessage",
+            "id": "message-assistant-empty",
+            "text": "",
+            "complete": False,
+        }
+    )
+    state = {"chatgpt": {"sessions": {}}}
+
+    result = export_chatgpt(
+        tmp_path / "out",
+        state,
+        source_input=Path("-"),
+        project_config=config,
+        full=False,
+        dry_run=False,
+        since_date=None,
+        stdin_text=json.dumps(snapshot),
+    )
+
+    assert result["exported"] == 1
+    session = state["chatgpt"]["sessions"]["thread-fixture"]
+    assert session["assistant_complete"] is False
+    assert [message["complete"] for message in session["messages"]] == [
+        True,
+        True,
+        False,
+    ]
+    path = next((tmp_path / "out").rglob("*.md"))
+    turns = parse_marked_markdown(path)
+    assert turns[-1].content == "[INCOMPLETE ASSISTANT CONTENT: source was truncated]"
+    assert turns[-1].complete is False
+
+
 def test_live_user_truncation_fails_closed_without_writing(tmp_path: Path) -> None:
     config = tmp_path / "routing.json"
     write_config(config)
@@ -590,6 +632,48 @@ def test_older_live_revision_cannot_overwrite_newer_live_state(tmp_path: Path) -
     assert result["failed"] == 1
     assert result["exported"] == 0
     assert "older than verified archive state" in result["warnings"][0]["error"]
+    assert path.read_bytes() == original
+
+
+def test_full_export_cannot_regress_revision_before_a_branch_change(
+    tmp_path: Path,
+) -> None:
+    state = {"chatgpt": {"sessions": {}}}
+    export_live(tmp_path, state, "Current live truth", updated_at=100)
+    path = next((tmp_path / "out" / "Approved_Project").glob("*.md"))
+    original = path.read_bytes()
+
+    same_branch_stale = live_snapshot("Current live truth")
+    same_branch_stale["projects"][0]["threads"][0]["updated_at"] = 50
+    first = export_chatgpt(
+        tmp_path / "out",
+        state,
+        source_input=Path("-"),
+        project_config=tmp_path / "routing.json",
+        full=True,
+        dry_run=False,
+        since_date=None,
+        stdin_text=json.dumps(same_branch_stale),
+    )
+
+    changed_branch_stale = live_snapshot("Stale changed branch")
+    changed_branch_stale["projects"][0]["threads"][0]["updated_at"] = 75
+    second = export_chatgpt(
+        tmp_path / "out",
+        state,
+        source_input=Path("-"),
+        project_config=tmp_path / "routing.json",
+        full=True,
+        dry_run=False,
+        since_date=None,
+        stdin_text=json.dumps(changed_branch_stale),
+    )
+
+    assert first["exported"] == 0
+    assert first["failed"] == 1
+    assert second["exported"] == 0
+    assert second["failed"] == 1
+    assert state["chatgpt"]["sessions"]["thread-fixture"]["thread_updated_at"] == 100
     assert path.read_bytes() == original
 
 

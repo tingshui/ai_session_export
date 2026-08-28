@@ -60,10 +60,12 @@ The primary users are individual developers who run multiple AI coding agents lo
 All paths shown are defaults and can be overridden via CLI flags (`--opencode-db`, `--antigravity-dir`, `--codex-dir`, `--codex-session-index`, `--cursor-db`, `--second-mind-json`, and the base directory).
 
 ChatGPT live snapshots are accepted only as complete `full_history` page chains.
-An App `…N tokens truncated…` sentinel is treated as an incomplete conversation:
-the adapter emits a failure warning and preserves the previous archive/state.
-Official exports are the completeness path for conversations whose individual
-items exceed the App read surface's output limit.
+Incomplete user content, including an App `…N tokens truncated…` sentinel,
+fails that conversation closed and preserves its previous archive/state.
+Incomplete assistant content remains useful context: it is archived with a
+visible warning and an incomplete machine marker, but is never represented as
+complete. An Official export may seed history exactly once; after that seed is
+completed, Live is authoritative and every later Official write is rejected.
 
 ## Markdown Output Contract
 
@@ -103,7 +105,7 @@ Field rules:
 - `turn_models` is emitted when at least one turn has attributable model identity. It is a JSON array aligned one-to-one with all rendered turn sections, uses `null` for unknown entries, and is omitted when every entry is unknown. Consumers must not infer per-turn attribution from `models_used`.
 - Each turn header is `## User` or `## Assistant`. When a per-turn timestamp is known, it is appended as `[HH:MM]` in local time.
 - The file is single-trailing-newline terminated; trailing whitespace is stripped from each message body.
-- Sources that expose stable message IDs may emit an invisible HTML turn marker containing the ID and body hash immediately before the corresponding heading. The visible heading/body contract remains unchanged.
+- Sources that expose stable message IDs may emit an invisible HTML turn marker containing the ID, body hash, and truthful `complete` boolean immediately before the corresponding heading. The visible heading/body contract remains unchanged except that incomplete assistant turns include an explicit warning in their body.
 
 This contract is the project's stability boundary. It must not change without an explicit decision recorded in `docs/working.md`.
 

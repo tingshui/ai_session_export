@@ -377,8 +377,9 @@ def _live_item_body(item: dict[str, Any], role: str) -> tuple[str, bool]:
     complete = explicit_complete and not bool(APP_TRUNCATION_SENTINEL_RE.search(body))
     if not complete and role == "user":
         raise ChatGPTExportError("live item contains incomplete user content")
-    if not complete and body:
-        body = "[INCOMPLETE ASSISTANT CONTENT: source was truncated]\n\n" + body
+    if not complete:
+        marker = "[INCOMPLETE ASSISTANT CONTENT: source was truncated]"
+        body = f"{marker}\n\n{body}" if body else marker
     return body, complete
 
 
@@ -785,21 +786,23 @@ def export_chatgpt(
                 previous.get("branch_fingerprint")
                 != conversation.branch_fingerprint
             )
-            if branch_changed and (
+            revision_regressed = (
+                previous_revision is not None
+                and incoming_revision is not None
+                and incoming_revision < previous_revision
+            )
+            changed_branch_is_not_newer = branch_changed and (
                 previous_revision is None
                 or incoming_revision is None
                 or incoming_revision <= previous_revision
-            ):
+            )
+            if revision_regressed or changed_branch_is_not_newer:
                 warnings.append(
                     {
                         "thread_id": conversation.record.session_id,
                         "error": (
                             "live revision is older than verified archive state"
-                            if (
-                                previous_revision is not None
-                                and incoming_revision is not None
-                                and incoming_revision < previous_revision
-                            )
+                            if revision_regressed
                             else "live revision authority is ambiguous"
                         ),
                     }

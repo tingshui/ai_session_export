@@ -182,7 +182,8 @@ def _run_export_unlocked(
 
 
 @contextmanager
-def _chatgpt_state_lock(state_file: Path):
+def _state_write_lock(state_file: Path):
+    """Serialize every writer that replaces the shared exporter state file."""
     lock_path = state_file.with_name(f"{state_file.name}.chatgpt.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as handle:
@@ -194,14 +195,11 @@ def _chatgpt_state_lock(state_file: Path):
 
 
 def run_export(source: str, **kwargs: Any) -> list[dict[str, Any]]:
-    """Serialize ChatGPT archive/state writers across local processes."""
+    """Serialize writers that share the exporter state across local processes."""
     state_file = Path(kwargs.get("state_file", STATE_FILE))
-    uses_chatgpt = source == "chatgpt" or (
-        source == "all" and kwargs.get("chatgpt_input") is not None
-    )
-    if not uses_chatgpt:
+    if kwargs.get("dry_run", False):
         return _run_export_unlocked(source, **kwargs)
-    with _chatgpt_state_lock(state_file):
+    with _state_write_lock(state_file):
         return _run_export_unlocked(source, **kwargs)
 
 
