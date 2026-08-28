@@ -4,6 +4,7 @@ import json
 import re
 from datetime import date, datetime
 from pathlib import Path
+from typing import Collection
 
 
 SUBAGENT_PATTERNS = (
@@ -31,12 +32,18 @@ def yaml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def unique_output_path(output_dir: Path, date_ymd: str, title: str) -> Path:
+def unique_output_path(
+    output_dir: Path,
+    date_ymd: str,
+    title: str,
+    *,
+    reserved_paths: Collection[Path] = (),
+) -> Path:
     prefix = date_ymd.replace("-", "")
     stem = f"{prefix}_{sanitize_filename(title)}"
     candidate = output_dir / f"{stem}.md"
     counter = 2
-    while candidate.exists():
+    while candidate.exists() or candidate in reserved_paths:
         candidate = output_dir / f"{stem}_{counter}.md"
         counter += 1
     return candidate

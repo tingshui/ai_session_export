@@ -767,6 +767,7 @@ def export_chatgpt(
     updated_sessions = dict(existing_sessions)
     exported = 0
     official_writes: list[tuple[Path, str]] = []
+    reserved_output_paths: set[Path] = set()
 
     for conversation in parsed:
         if since_date and date.fromisoformat(conversation.record.date) < since_date:
@@ -820,8 +821,12 @@ def export_chatgpt(
         project_dir = output_dir / project_slug
         if output_path is None:
             output_path = unique_output_path(
-                project_dir, conversation.record.date, conversation.record.title
+                project_dir,
+                conversation.record.date,
+                conversation.record.title,
+                reserved_paths=reserved_output_paths,
             )
+        reserved_output_paths.add(output_path)
         rendered = render_markdown(conversation.record)
         if not dry_run:
             if is_live:
@@ -843,7 +848,7 @@ def export_chatgpt(
             }
         exported += 1
 
-    if official_writes and not dry_run:
+    if not is_live and not dry_run:
         previous_files: list[tuple[Path, bytes | None]] = []
         try:
             for path, rendered in official_writes:
@@ -851,6 +856,18 @@ def export_chatgpt(
                     (path, path.read_bytes() if path.is_file() else None)
                 )
                 _atomic_write_text(path, rendered)
+            state["chatgpt"] = {
+                **source_state,
+                "sessions": updated_sessions,
+                "official_seed": {
+                    "status": "completed",
+                    "input_sha256": official_input_sha256,
+                    "started_at": seed_started_at,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                },
+            }
+            if checkpoint_state is not None:
+                checkpoint_state(state)
         except Exception:
             for path, previous in reversed(previous_files):
                 _restore_archive_file(path, previous)
@@ -863,16 +880,9 @@ def export_chatgpt(
                 checkpoint_state(state)
             raise
 
-    if not dry_run:
+    if is_live and not dry_run:
         final_state = {**source_state, "sessions": updated_sessions}
-        if not is_live:
-            final_state["official_seed"] = {
-                "status": "completed",
-                "input_sha256": official_input_sha256,
-                "started_at": seed_started_at,
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-            }
-        elif "official_seed" in source_state:
+        if "official_seed" in source_state:
             final_state["official_seed"] = seed
         state["chatgpt"] = final_state
         if checkpoint_state is not None:

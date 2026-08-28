@@ -14,7 +14,7 @@ from ai_session_export import cli as cli_module
 from ai_session_export.cli import run_export
 import ai_session_export.sources.chatgpt as chatgpt_module
 from ai_session_export.sources.chatgpt import ChatGPTExportError, export_chatgpt
-from ai_session_export.state import load_state
+from ai_session_export.state import load_state, save_state
 
 
 PROJECT_ID = "g-p-approved"
@@ -900,6 +900,80 @@ def test_official_write_failure_rolls_back_archive_and_seed_state(
         )
 
     assert list((tmp_path / "archive").rglob("*.md")) == []
+    persisted = load_state(state_file)
+    assert persisted["chatgpt"]["official_seed"] == {"status": "unused"}
+    assert persisted["chatgpt"]["sessions"] == {}
+
+
+def test_official_batch_reserves_distinct_paths_for_same_date_and_title(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    conversations = official_conversations()[:1]
+    conversations.append(
+        json.loads(
+            json.dumps(conversations[0])
+            .replace("thread-fixture", "thread-second")
+            .replace("message-user", "message-user-second")
+            .replace("message-assistant", "message-assistant-second")
+        )
+    )
+    source = tmp_path / "official.zip"
+    write_official_zip(source, conversations)
+    state = {"chatgpt": {"sessions": {}}}
+
+    result = export_chatgpt(
+        tmp_path / "out",
+        state,
+        source_input=source,
+        project_config=config,
+        full=False,
+        dry_run=False,
+        since_date=None,
+    )
+
+    assert result["exported"] == 2
+    archive_files = list((tmp_path / "out").rglob("*.md"))
+    assert len(archive_files) == 2
+    output_files = {
+        session["output_file"]
+        for session in state["chatgpt"]["sessions"].values()
+    }
+    assert len(output_files) == 2
+
+
+def test_final_official_checkpoint_failure_rolls_back_files_and_seed(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    source = tmp_path / "official.zip"
+    write_official_zip(source, official_conversations())
+    state_file = tmp_path / "state.json"
+    state = {"chatgpt": {"sessions": {}}}
+    checkpoints = 0
+
+    def fail_completed_checkpoint(current: dict[str, object]) -> None:
+        nonlocal checkpoints
+        checkpoints += 1
+        if checkpoints == 2:
+            raise OSError("synthetic completed checkpoint failure")
+        save_state(current, state_file)
+
+    with pytest.raises(OSError, match="completed checkpoint failure"):
+        export_chatgpt(
+            tmp_path / "out",
+            state,
+            source_input=source,
+            project_config=config,
+            full=False,
+            dry_run=False,
+            since_date=None,
+            checkpoint_state=fail_completed_checkpoint,
+        )
+
+    assert list((tmp_path / "out").rglob("*.md")) == []
     persisted = load_state(state_file)
     assert persisted["chatgpt"]["official_seed"] == {"status": "unused"}
     assert persisted["chatgpt"]["sessions"] == {}
