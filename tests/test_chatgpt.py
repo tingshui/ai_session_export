@@ -27,7 +27,7 @@ def test_sensitive_stdin_reads_piped_json(monkeypatch: pytest.MonkeyPatch) -> No
     assert cli_module._read_sensitive_stdin() == '{"schema_version": 1}'
 
 
-def test_live_app_truncation_sentinel_fails_conversation_without_writing(
+def test_live_assistant_truncation_is_archived_and_marked_incomplete(
     tmp_path: Path,
 ) -> None:
     config = tmp_path / "routing.json"
@@ -49,9 +49,41 @@ def test_live_app_truncation_sentinel_fails_conversation_without_writing(
         stdin_text=json.dumps(snapshot),
     )
 
+    assert result["failed"] == 0
+    assert result["exported"] == 1
+    session = state["chatgpt"]["sessions"]["thread-fixture"]
+    assert session["user_complete"] is True
+    assert session["assistant_complete"] is False
+    assert [message["complete"] for message in session["messages"]] == [True, False]
+    path = next((tmp_path / "out").rglob("*.md"))
+    assert "INCOMPLETE ASSISTANT CONTENT" in path.read_text(encoding="utf-8")
+    turns = parse_marked_markdown(path)
+    assert [(turn.role, turn.complete) for turn in turns] == [
+        ("user", True),
+        ("assistant", False),
+    ]
+
+
+def test_live_user_truncation_fails_closed_without_writing(tmp_path: Path) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    snapshot = live_snapshot("prefix…7 tokens truncated…suffix")
+    state = {"chatgpt": {"sessions": {}}}
+
+    result = export_chatgpt(
+        tmp_path / "out",
+        state,
+        source_input=Path("-"),
+        project_config=config,
+        full=False,
+        dry_run=False,
+        since_date=None,
+        stdin_text=json.dumps(snapshot),
+    )
+
     assert result["failed"] == 1
     assert result["exported"] == 0
-    assert "truncation sentinel" in result["warnings"][0]["error"]
+    assert "incomplete user content" in result["warnings"][0]["error"]
     assert not (tmp_path / "out").exists()
     assert state == {"chatgpt": {"sessions": {}}}
 
@@ -252,6 +284,10 @@ def test_live_export_is_project_scoped_and_state_contains_no_raw_text(tmp_path: 
     assert "Synthetic private question" not in serialized_state
     assert "Synthetic assistant answer" not in serialized_state
     assert state["chatgpt"]["sessions"]["thread-fixture"]["project_id"] == PROJECT_ID
+    session = state["chatgpt"]["sessions"]["thread-fixture"]
+    assert session["user_complete"] is True
+    assert session["assistant_complete"] is True
+    assert all(message["complete"] is True for message in session["messages"])
 
 
 def test_identical_live_rerun_changes_neither_file_nor_state(tmp_path: Path) -> None:

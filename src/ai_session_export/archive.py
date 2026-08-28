@@ -18,6 +18,7 @@ class MarkedTurn(NamedTuple):
     content: str
     message_id: str
     content_sha256: str
+    complete: bool
 
 
 def content_sha256(content: str) -> str:
@@ -47,10 +48,13 @@ def parse_marked_markdown_text(text: str) -> list[MarkedTurn]:
             raise ValueError("ChatGPT turn marker must be an object")
         message_id = str(marker.get("message_id") or "").strip()
         expected_sha256 = str(marker.get("sha256") or "").strip().lower()
+        complete = marker.get("complete", True)
         if not message_id or message_id in seen:
             raise ValueError(f"missing or duplicate ChatGPT message ID: {message_id!r}")
         if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
             raise ValueError(f"invalid ChatGPT content hash: {message_id}")
+        if not isinstance(complete, bool):
+            raise ValueError(f"invalid ChatGPT completeness marker: {message_id}")
         seen.add(message_id)
 
         section_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
@@ -71,6 +75,7 @@ def parse_marked_markdown_text(text: str) -> list[MarkedTurn]:
                 content=logical_body,
                 message_id=message_id,
                 content_sha256=actual_sha256,
+                complete=complete,
             )
         )
     return turns

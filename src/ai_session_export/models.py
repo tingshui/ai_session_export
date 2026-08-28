@@ -9,6 +9,7 @@ class MessageTurn(NamedTuple):
     time_created: int | None = None  # ms epoch of the turn's first message, if known
     model: str | None = None  # target/responder model for this turn, if attributable
     message_id: str | None = None  # stable source identity when the source exposes one
+    complete: bool = True  # role-specific source completeness for archive validation
 
 
 class SessionRecord(NamedTuple):

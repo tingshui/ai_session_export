@@ -37,6 +37,7 @@ def render_markdown(session: SessionRecord) -> str:
             marker = {
                 "message_id": message.message_id,
                 "sha256": content_sha256(body),
+                "complete": message.complete,
             }
             lines.append(
                 TURN_MARKER_PREFIX

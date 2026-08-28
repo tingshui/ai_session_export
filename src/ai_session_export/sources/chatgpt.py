@@ -37,6 +37,8 @@ class ParsedChatGPTConversation(NamedTuple):
     coverage: str
     branch_fingerprint: str
     message_metadata: list[dict[str, Any]]
+    user_complete: bool
+    assistant_complete: bool
     input_kind: str
 
 
@@ -265,6 +267,7 @@ def _message_metadata(messages: list[MessageTurn]) -> list[dict[str, Any]]:
             "role": message.role,
             "created_at": message.time_created,
             "content_sha256": _sha256(message.content.rstrip()),
+            "complete": message.complete,
         }
         for message in messages
     ]
@@ -334,37 +337,44 @@ def parse_official_conversation(
         coverage="full_history",
         branch_fingerprint=_branch_fingerprint(metadata),
         message_metadata=metadata,
+        user_complete=True,
+        assistant_complete=True,
         input_kind="official_export",
     )
 
 
-def _live_item_body(item: dict[str, Any]) -> str:
+def _live_item_body(item: dict[str, Any], role: str) -> tuple[str, bool]:
     item_type = item.get("type")
+    body = ""
     if item_type == "agentMessage":
         text = item.get("text")
         if isinstance(text, str):
             body = text.strip()
-            if APP_TRUNCATION_SENTINEL_RE.search(body):
-                raise ChatGPTExportError("live item contains App truncation sentinel")
-            return body
-    content = item.get("content")
-    if isinstance(content, str):
-        body = content.strip()
-        if APP_TRUNCATION_SENTINEL_RE.search(body):
-            raise ChatGPTExportError("live item contains App truncation sentinel")
-        return body
-    if not isinstance(content, list):
-        return ""
-    parts: list[str] = []
-    for part in content:
-        if isinstance(part, str):
-            parts.append(part)
-        elif isinstance(part, dict) and part.get("type") in {"text", "input_text", "output_text"}:
-            parts.append(str(part.get("text") or ""))
-    body = "\n\n".join(part for part in parts if part).strip()
-    if APP_TRUNCATION_SENTINEL_RE.search(body):
-        raise ChatGPTExportError("live item contains App truncation sentinel")
-    return body
+    if not body:
+        content = item.get("content")
+        if isinstance(content, str):
+            body = content.strip()
+        elif isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict) and part.get("type") in {
+                    "text",
+                    "input_text",
+                    "output_text",
+                }:
+                    parts.append(str(part.get("text") or ""))
+            body = "\n\n".join(part for part in parts if part).strip()
+    explicit_complete = item.get("complete", True)
+    if not isinstance(explicit_complete, bool):
+        raise ChatGPTExportError("live item complete must be boolean")
+    complete = explicit_complete and not bool(APP_TRUNCATION_SENTINEL_RE.search(body))
+    if not complete and role == "user":
+        raise ChatGPTExportError("live item contains incomplete user content")
+    if not complete and body:
+        body = "[INCOMPLETE ASSISTANT CONTENT: source was truncated]\n\n" + body
+    return body, complete
 
 
 def _validate_full_history_pagination(thread: dict[str, Any], thread_id: str) -> None:
@@ -408,8 +418,8 @@ def parse_live_thread(
     thread: dict[str, Any], project_id: str, project_label: str
 ) -> ParsedChatGPTConversation:
     thread_id = _require_id(thread.get("thread_id") or thread.get("id"), "thread_id")
-    if thread.get("complete") is not True:
-        raise ChatGPTExportError(f"incomplete live thread: {thread_id}")
+    if not isinstance(thread.get("complete"), bool):
+        raise ChatGPTExportError(f"live thread complete must be boolean: {thread_id}")
     coverage = str(thread.get("coverage") or "")
     if coverage != "full_history":
         raise ChatGPTExportError(
@@ -437,7 +447,7 @@ def parse_live_thread(
             role = "user" if item_type == "userMessage" else "assistant" if item_type == "agentMessage" else ""
             if not role:
                 continue
-            body = _live_item_body(item)
+            body, complete = _live_item_body(item, role)
             if not body:
                 continue
             message_id = _require_id(item.get("id"), "message_id")
@@ -455,6 +465,7 @@ def parse_live_thread(
                     or turn_timestamp,
                     model=model,
                     message_id=message_id,
+                    complete=complete,
                 )
             )
     if not messages:
@@ -462,6 +473,16 @@ def parse_live_thread(
     title = str(thread.get("title") or "").strip() or messages[0].content.splitlines()[0][:120]
     started_at = _epoch_ms(thread.get("created_at") or thread.get("createdAt")) or messages[0].time_created
     metadata = _message_metadata(messages)
+    user_complete = all(
+        message.complete for message in messages if message.role == "user"
+    )
+    assistant_complete = all(
+        message.complete for message in messages if message.role == "assistant"
+    )
+    if thread.get("complete") is False and user_complete and assistant_complete:
+        raise ChatGPTExportError(
+            f"incomplete live thread lacks role-specific evidence: {thread_id}"
+        )
     return ParsedChatGPTConversation(
         record=SessionRecord(
             source="chatgpt",
@@ -477,6 +498,8 @@ def parse_live_thread(
         coverage=coverage,
         branch_fingerprint=_branch_fingerprint(metadata),
         message_metadata=metadata,
+        user_complete=user_complete,
+        assistant_complete=assistant_complete,
         input_kind="live_snapshot",
     )
 
@@ -779,6 +802,8 @@ def export_chatgpt(
                 "coverage": conversation.coverage,
                 "branch_fingerprint": conversation.branch_fingerprint,
                 "messages": conversation.message_metadata,
+                "user_complete": conversation.user_complete,
+                "assistant_complete": conversation.assistant_complete,
                 "last_seen_at": observed_at,
                 "last_input_kind": conversation.input_kind,
             }
