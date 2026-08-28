@@ -7,7 +7,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from .sources import export_antigravity, export_claude_code, export_codex, export_cursor, export_dsh, export_opencode, export_second_mind
+from .sources import export_antigravity, export_chatgpt, export_claude_code, export_codex, export_cursor, export_dsh, export_opencode, export_second_mind
 from .sources.claude_code import DEFAULT_CLAUDE_HISTORY_FILES, DEFAULT_CLAUDE_PROJECT_DIRS
 from .sources.codex import DEFAULT_CODEX_SESSION_DIRS, DEFAULT_CODEX_SESSION_INDEX
 from .sources.cursor import DEFAULT_CURSOR_DB
@@ -21,7 +21,27 @@ SECOND_MIND_JSON = BASE_DIR / "second_mind_export.json"
 STATE_FILE = BASE_DIR / ".export_state.json"
 DEFAULT_OPENCODE_DB = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
 
-SOURCE_CHOICES = ["all", "second-mind", "opencode", "claude-code", "antigravity", "codex", "cursor", "dsh"]
+SOURCE_CHOICES = ["all", "second-mind", "opencode", "claude-code", "antigravity", "codex", "chatgpt", "cursor", "dsh"]
+
+
+def _read_sensitive_stdin() -> str:
+    """Read one JSON document without echoing it when stdin is a terminal."""
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+
+    import termios
+
+    fd = sys.stdin.fileno()
+    original = termios.tcgetattr(fd)
+    protected = termios.tcgetattr(fd)
+    protected[3] &= ~(termios.ECHO | termios.ICANON)
+    protected[6][termios.VMIN] = 1
+    protected[6][termios.VTIME] = 0
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, protected)
+        return sys.stdin.readline()
+    finally:
+        termios.tcsetattr(fd, termios.TCSANOW, original)
 
 
 def run_export(
@@ -40,6 +60,9 @@ def run_export(
     claude_history_files: tuple[Path, ...] | None = None,
     codex_session_dirs: tuple[Path, ...] | None = None,
     codex_session_index: Path = DEFAULT_CODEX_SESSION_INDEX,
+    chatgpt_input: Path | None = None,
+    chatgpt_project_config: Path | None = None,
+    chatgpt_stdin_text: str | None = None,
     cursor_db: Path = DEFAULT_CURSOR_DB,
     dsh_sessions_dir: Path = DEFAULT_DSH_SESSIONS_DIR,
 ) -> list[dict[str, Any]]:
@@ -104,6 +127,25 @@ def run_export(
                 session_index=codex_session_index,
             )
         )
+    if source == "chatgpt" or (
+        source == "all" and chatgpt_input is not None and chatgpt_project_config is not None
+    ):
+        if chatgpt_input is None or chatgpt_project_config is None:
+            raise ValueError(
+                "ChatGPT export requires --chatgpt-input and --chatgpt-project-config"
+            )
+        results.append(
+            export_chatgpt(
+                base_dir / "chatgpt",
+                state,
+                source_input=chatgpt_input,
+                project_config=chatgpt_project_config,
+                full=full,
+                dry_run=dry_run,
+                since_date=since_date,
+                stdin_text=chatgpt_stdin_text,
+            )
+        )
     if source in {"cursor", "all"}:
         results.append(
             export_cursor(
@@ -159,6 +201,16 @@ def parse_args() -> argparse.Namespace:
         help="Override the Codex session_index.jsonl path.",
     )
     parser.add_argument(
+        "--chatgpt-input",
+        type=Path,
+        help="Official ChatGPT export directory/zip, or '-' for a live snapshot on stdin.",
+    )
+    parser.add_argument(
+        "--chatgpt-project-config",
+        type=Path,
+        help="Explicit ChatGPT Project allowlist/routing config.",
+    )
+    parser.add_argument(
         "--cursor-db",
         type=Path,
         default=DEFAULT_CURSOR_DB,
@@ -176,6 +228,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    chatgpt_input = getattr(args, "chatgpt_input", None)
+    chatgpt_project_config = getattr(args, "chatgpt_project_config", None)
+    chatgpt_stdin_text = None
+    if chatgpt_input is not None and str(chatgpt_input) == "-":
+        chatgpt_stdin_text = _read_sensitive_stdin()
     results = run_export(
         args.source,
         full=args.full,
@@ -187,6 +244,9 @@ def main() -> None:
         antigravity_brain_dir=args.antigravity_dir,
         codex_session_dirs=tuple(args.codex_dir) if args.codex_dir else None,
         codex_session_index=args.codex_session_index,
+        chatgpt_input=chatgpt_input,
+        chatgpt_project_config=chatgpt_project_config,
+        chatgpt_stdin_text=chatgpt_stdin_text,
         cursor_db=args.cursor_db,
         dsh_sessions_dir=args.dsh_sessions_dir,
         since_date=args.since_date,
@@ -201,9 +261,13 @@ def main() -> None:
             failure_summary = f" failed={failed}" if failed else ""
             print(f"[{source}] exported={result['exported']} scanned={result['scanned']}{failure_summary}{suffix}")
             for warning in result.get("warnings", []):
-                print(
-                    f"[{source}:{warning['surface']}] line {warning['line']}: {warning['error']}",
-                    file=sys.stderr,
-                )
+                if "surface" in warning and "line" in warning:
+                    print(
+                        f"[{source}:{warning['surface']}] line {warning['line']}: {warning['error']}",
+                        file=sys.stderr,
+                    )
+                else:
+                    detail = str(warning.get("thread_id") or "unknown")
+                    print(f"[{source}:{detail}] {warning['error']}", file=sys.stderr)
     if any(int(result.get("failed", 0)) for result in results):
         raise SystemExit(1)

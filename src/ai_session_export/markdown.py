@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from .archive import TURN_MARKER_PREFIX, content_sha256, escape_turn_marker_content
 from .models import SessionRecord
 from .utils import ms_to_hhmm, yaml_string
 
@@ -31,13 +32,24 @@ def render_markdown(session: SessionRecord) -> str:
     lines.extend(["---", "", f"# {session.title}", ""])
 
     for message in session.messages:
+        body = message.content.rstrip()
+        if message.message_id:
+            marker = {
+                "message_id": message.message_id,
+                "sha256": content_sha256(body),
+            }
+            lines.append(
+                TURN_MARKER_PREFIX
+                + json.dumps(marker, ensure_ascii=False, separators=(",", ":"))
+                + " -->"
+            )
         section = "User" if message.role == "user" else "Assistant"
         if message.time_created:
             lines.append(f"## {section} [{ms_to_hhmm(message.time_created)}]")
         else:
             lines.append(f"## {section}")
         lines.append("")
-        lines.append(message.content.rstrip())
+        lines.append(escape_turn_marker_content(body) if message.message_id else body)
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"

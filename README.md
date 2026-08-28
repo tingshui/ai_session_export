@@ -9,6 +9,7 @@ Export AI coding session transcripts from multiple tools into a unified Markdown
 | OpenCode | `~/.local/share/opencode/opencode.db` |
 | Claude Code | `~/.claude/projects/**/*.jsonl` |
 | Codex | `~/.codex/sessions/**/*.jsonl`, `~/.codex/archived_sessions/*.jsonl` |
+| ChatGPT Projects | Codex App live snapshot on stdin, or an official export directory/zip |
 | Google Antigravity 2.0 | `~/.gemini/antigravity/brain/*/.system_generated/logs/transcript_full.jsonl` |
 | Google Antigravity IDE | `~/.gemini/antigravity-ide/brain/*/.system_generated/logs/transcript_full.jsonl` |
 | Google Antigravity CLI | `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl` |
@@ -28,6 +29,7 @@ python export_sessions.py
 # Export specific source
 python export_sessions.py --source antigravity
 python export_sessions.py --source codex
+python export_sessions.py --source chatgpt --chatgpt-input /path/to/export.zip --chatgpt-project-config /path/to/project-config.json
 python export_sessions.py --source cursor
 python export_sessions.py --source dsh
 
@@ -63,6 +65,16 @@ injections, tolerates torn trailing records (including a truncated final
 Zstandard frame), and rewrites one stable file per growing live session.
 Decompression shells out to the `zstd` binary.
 
+The ChatGPT source is explicitly Project-scoped. It exports only exact Project
+IDs in `--chatgpt-project-config`, accepts either a transient Codex App snapshot
+(`--chatgpt-input -`) or an official OpenAI export directory/zip, and writes one
+stable Markdown file per current conversation branch under
+`chatgpt/<project-label>/`. It never discovers or exports Projectless chats.
+Live snapshots must prove full pagination; official exports are the historical
+reconciliation path. Codex App reads must use its documented per-page limits;
+if any item carries an App truncation sentinel, that conversation fails without
+overwriting its previous Markdown or state.
+
 ## Output Format
 
 Each session is exported as a Markdown file with YAML frontmatter:
@@ -97,6 +109,10 @@ one-to-one with the rendered `User` and `Assistant` sections. Unknown entries ar
 session-level inventory and must not be used to guess per-turn attribution.
 Antigravity records additionally include `surface: "2"`, `surface: "ide"`, or
 `surface: "cli"`.
+
+ChatGPT turns additionally carry an HTML comment with their stable message ID
+and content hash. The comment is invisible in rendered Markdown and lets an
+archive consumer verify that the readable body still matches exporter state.
 
 ## Installation as a Coding Agent Skill
 

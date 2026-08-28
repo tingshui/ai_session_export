@@ -1,5 +1,14 @@
 ## Changelog
 
+### 2026-08-27
+
+- Added an allowlisted ChatGPT Project adapter with two inputs: full-history Codex App snapshots on stdin for daily freshness and official export directories/zips for historical reconciliation.
+- ChatGPT terminal stdin disables echo, and App truncation sentinels fail the affected conversation without overwriting its prior archive/state.
+- Both inputs normalize to the same current-branch `SessionRecord`, stable per-Project Markdown path, per-thread branch fingerprint, and raw-text-free message metadata state.
+- Extended the Markdown contract with optional invisible message-ID/content-hash markers. Existing sources emit no marker and preserve their rendered bytes; marker-shaped ChatGPT content is escaped and round-trips through the canonical parser.
+- Added exact Project-ID filtering before message parsing, strict official tree/current-node validation, full-pagination proof for live reads, atomic Markdown replacement with reread verification, per-conversation failure isolation, dry-run immutability, and synthetic live/zip parity tests.
+- Recorded the Project-scoped archive vocabulary and five user-confirmed architecture decisions in `CONTEXT.md` and `docs/adr/`.
+
 ### 2026-08-14
 
 - Added the DeepSeek Harness source adapter (`src/ai_session_export/sources/dsh.py`), registered in `sources/__init__.py`, `cli.py`, and `state.py` (`DEFAULT_STATE`).

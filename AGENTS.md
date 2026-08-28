@@ -2,7 +2,7 @@
 
 ## What This Project Is
 
-A public Python tool that exports AI coding session transcripts from multiple sources (OpenCode, Claude Code, Codex, Google Antigravity, Second Mind) into a unified Markdown archive format.
+A public Python tool that exports AI session transcripts from multiple sources (OpenCode, Claude Code, Codex, approved ChatGPT Projects, Google Antigravity, Cursor, DeepSeek Harness, Second Mind) into a unified Markdown archive format.
 
 ## Working Environment
 
@@ -20,6 +20,7 @@ src/ai_session_export/     # reusable Python package
     opencode.py
     claude_code.py
     codex.py
+    chatgpt.py
     antigravity.py
 scripts/                   # shell entrypoints
 tests/                     # unit + integration + live e2e

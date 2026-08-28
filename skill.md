@@ -1,9 +1,9 @@
 ---
 name: ai-session-export
 description: >-
-  Export AI coding session transcripts from OpenCode, Claude Code, Codex, Google
-  Antigravity, Cursor, DeepSeek Harness, and Second Mind into a unified Markdown
-  archive. Run as a CLI or periodic cron job.
+  Export AI session transcripts from OpenCode, Claude Code, Codex, approved
+  ChatGPT Projects, Google Antigravity, Cursor, DeepSeek Harness, and Second Mind
+  into a unified Markdown archive. Run as a CLI or periodic job.
 ---
 
 # AI Session Export Skill
@@ -36,6 +36,7 @@ python export_sessions.py
 # Export a specific source
 python export_sessions.py --source antigravity
 python export_sessions.py --source codex
+python export_sessions.py --source chatgpt --chatgpt-input /path/to/export.zip --chatgpt-project-config /path/to/project-config.json
 python export_sessions.py --source cursor
 python export_sessions.py --source dsh
 
@@ -102,12 +103,19 @@ Antigravity emits `surface` as `"2"`, `"ide"`, or `"cli"`.
 | OpenCode | `~/.local/share/opencode/opencode.db` | SQLite |
 | Claude Code | `~/.claude/projects/**/*.jsonl` | JSONL |
 | Codex | `~/.codex/sessions/**/*.jsonl`, `~/.codex/archived_sessions/*.jsonl` | JSONL |
+| ChatGPT Projects | Codex App snapshot on stdin or official export directory/zip | JSON |
 | Antigravity 2.0 | `~/.gemini/antigravity/brain/*/.system_generated/logs/transcript_full.jsonl` | JSONL |
 | Antigravity IDE | `~/.gemini/antigravity-ide/brain/*/.system_generated/logs/transcript_full.jsonl` | JSONL |
 | Antigravity CLI | `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl` | JSONL |
 | Cursor | `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` | SQLite |
 | DeepSeek Harness | `~/.dsh/sessions/*/*/session.jsonl*` | Zstandard-compressed JSONL |
 | Second Mind | `./second_mind_export.json` | JSON |
+
+For ChatGPT live input, paginate each approved conversation to `hasMore=false`
+using the App's supported limits. Never label a response `full_history` if an
+item contains an App truncation sentinel; retain the previous Markdown/state
+and use an official export for recovery. When stdin is a terminal, the CLI
+disables echo while reading the one-line JSON snapshot.
 
 ## Adding a New Source
 
