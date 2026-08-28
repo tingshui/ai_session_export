@@ -22,6 +22,7 @@ APP_TRUNCATION_SENTINEL_RE = re.compile(
     r"(?:…|\.{3})\s*\d+\s+tokens?\s+truncated\s*(?:…|\.{3})",
     re.IGNORECASE,
 )
+LIVE_DISCOVERY_SOURCE = "chatgpt_app"
 
 
 class ChatGPTExportError(RuntimeError):
@@ -483,20 +484,88 @@ def parse_live_thread(
 def parse_live_snapshot(
     payload: dict[str, Any], allowlist: dict[str, str]
 ) -> tuple[list[ParsedChatGPTConversation], int, list[dict[str, str]]]:
-    if payload.get("schema_version") != 1 or not isinstance(payload.get("projects"), list):
+    if payload.get("schema_version") != 1:
         raise ChatGPTExportError("unsupported live ChatGPT snapshot")
-    parsed: list[ParsedChatGPTConversation] = []
+    observed_at = payload.get("observed_at")
+    if not isinstance(observed_at, str) or not observed_at.strip():
+        raise ChatGPTExportError("live snapshot observed_at must be an ISO-8601 timestamp")
+    try:
+        observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ChatGPTExportError(
+            "live snapshot observed_at must be an ISO-8601 timestamp"
+        ) from error
+    if observed.tzinfo is None or observed.utcoffset() is None:
+        raise ChatGPTExportError("live snapshot observed_at must include a timezone")
+
+    discovery = payload.get("discovery")
+    if not isinstance(discovery, dict):
+        raise ChatGPTExportError("live snapshot discovery must be an object")
+    if discovery.get("source") != LIVE_DISCOVERY_SOURCE:
+        raise ChatGPTExportError("live snapshot discovery source is unsupported")
+
+    def require_count(field: str, *, positive: bool = False) -> int:
+        value = discovery.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ChatGPTExportError(f"live snapshot discovery {field} must be an integer")
+        minimum = 1 if positive else 0
+        if value < minimum:
+            qualifier = "positive" if positive else "non-negative"
+            raise ChatGPTExportError(
+                f"live snapshot discovery {field} must be {qualifier}"
+            )
+        return value
+
+    returned = require_count("non_pinned_returned")
+    limit = require_count("non_pinned_limit", positive=True)
+    require_count("approved_pinned_threads")
+    if returned > limit:
+        raise ChatGPTExportError(
+            "live snapshot discovery non_pinned_returned exceeds non_pinned_limit"
+        )
+    saturated = discovery.get("recent_window_saturated")
+    if not isinstance(saturated, bool):
+        raise ChatGPTExportError(
+            "live snapshot discovery recent_window_saturated must be boolean"
+        )
+    if saturated != (returned >= limit):
+        raise ChatGPTExportError(
+            "live snapshot discovery recent_window_saturated is inconsistent"
+        )
+
+    projects = payload.get("projects")
+    if not isinstance(projects, list):
+        raise ChatGPTExportError("live snapshot projects must be an array")
+    approved_projects: list[tuple[str, str, dict[str, Any]]] = []
+    seen_projects: set[str] = set()
     ignored = 0
-    warnings: list[dict[str, str]] = []
-    seen_threads: set[str] = set()
-    for project in payload["projects"]:
+    for project in projects:
         if not isinstance(project, dict):
             raise ChatGPTExportError("live snapshot contains non-object project")
-        project_id = str(project.get("project_id") or "")
+        project_id = project.get("project_id")
+        if project_id is None or project_id == "":
+            ignored += 1
+            continue
+        if not isinstance(project_id, str) or not PROJECT_ID_RE.fullmatch(project_id):
+            raise ChatGPTExportError("live snapshot contains malformed project identifier")
         label = allowlist.get(project_id)
         if label is None:
             ignored += 1
             continue
+        if project_id in seen_projects:
+            raise ChatGPTExportError(f"duplicate approved project: {project_id}")
+        seen_projects.add(project_id)
+        approved_projects.append((project_id, label, project))
+    missing_projects = sorted(set(allowlist) - seen_projects)
+    if missing_projects:
+        raise ChatGPTExportError(
+            "live snapshot missing approved projects: " + ",".join(missing_projects)
+        )
+
+    parsed: list[ParsedChatGPTConversation] = []
+    warnings: list[dict[str, str]] = []
+    seen_threads: set[str] = set()
+    for project_id, label, project in approved_projects:
         threads = project.get("threads")
         if not isinstance(threads, list):
             raise ChatGPTExportError(f"approved project threads must be an array: {project_id}")

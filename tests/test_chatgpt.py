@@ -85,9 +85,11 @@ def live_snapshot(user_text: str = "Synthetic private question") -> dict:
         "schema_version": 1,
         "observed_at": "2026-08-27T12:00:00Z",
         "discovery": {
+            "source": "chatgpt_app",
             "non_pinned_returned": 1,
             "non_pinned_limit": 50,
             "approved_pinned_threads": 0,
+            "recent_window_saturated": False,
         },
         "projects": [
             {
@@ -597,3 +599,181 @@ def test_cli_persists_in_progress_before_official_archive_write(
             chatgpt_input=source,
             chatgpt_project_config=config,
         )
+
+
+def test_live_envelope_requires_every_approved_project_before_body_parse(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    config_payload = json.loads(config.read_text(encoding="utf-8"))
+    config_payload["projects"]["g-p-second"] = copy.deepcopy(
+        config_payload["projects"][PROJECT_ID]
+    )
+    config_payload["projects"]["g-p-second"]["label"] = "Second Approved"
+    config.write_text(json.dumps(config_payload), encoding="utf-8")
+    snapshot = live_snapshot("PRIVATE CANARY MUST NOT APPEAR")
+    state = {
+        "chatgpt": {
+            "sessions": {
+                "existing": {
+                    "content_hash": "stable",
+                    "output_file": "Approved_Project/existing.md",
+                }
+            }
+        }
+    }
+    archive = tmp_path / "out" / "Approved_Project" / "existing.md"
+    archive.parent.mkdir(parents=True)
+    archive.write_text("stable archive", encoding="utf-8")
+    original_state = copy.deepcopy(state)
+
+    with pytest.raises(ChatGPTExportError) as caught:
+        export_chatgpt(
+            tmp_path / "out",
+            state,
+            source_input=Path("-"),
+            project_config=config,
+            full=False,
+            dry_run=False,
+            since_date=None,
+            stdin_text=json.dumps(snapshot),
+        )
+
+    assert "g-p-second" in str(caught.value)
+    assert "PRIVATE CANARY" not in str(caught.value)
+    assert state == original_state
+    assert archive.read_text(encoding="utf-8") == "stable archive"
+
+
+def test_live_envelope_rejects_duplicate_approved_project(tmp_path: Path) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    snapshot = live_snapshot()
+    snapshot["projects"].append(copy.deepcopy(snapshot["projects"][0]))
+
+    with pytest.raises(ChatGPTExportError, match="duplicate approved project"):
+        export_chatgpt(
+            tmp_path / "out",
+            {"chatgpt": {"sessions": {}}},
+            source_input=Path("-"),
+            project_config=config,
+            full=False,
+            dry_run=False,
+            since_date=None,
+            stdin_text=json.dumps(snapshot),
+        )
+
+    assert not (tmp_path / "out").exists()
+
+
+def test_unapproved_and_projectless_bodies_are_filtered_before_parse(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    snapshot = live_snapshot()
+    snapshot["projects"].append(
+        {"project_id": None, "threads": {"private": "PROJECTLESS CANARY"}}
+    )
+
+    result = export_chatgpt(
+        tmp_path / "out",
+        {"chatgpt": {"sessions": {}}},
+        source_input=Path("-"),
+        project_config=config,
+        full=False,
+        dry_run=False,
+        since_date=None,
+        stdin_text=json.dumps(snapshot),
+    )
+
+    assert result["exported"] == 1
+    assert result["ignored"] == 2
+    markdown = next((tmp_path / "out").rglob("*.md")).read_text(encoding="utf-8")
+    assert "PROJECTLESS CANARY" not in markdown
+    assert "must not be inspected" not in markdown
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source", "unknown_collector"),
+        ("non_pinned_returned", -1),
+        ("non_pinned_limit", 0),
+        ("approved_pinned_threads", -1),
+        ("recent_window_saturated", True),
+    ],
+)
+def test_live_envelope_rejects_invalid_discovery_metadata(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    snapshot = live_snapshot("DISCOVERY PRIVATE CANARY")
+    snapshot["discovery"][field] = value
+    state = {"chatgpt": {"sessions": {}}}
+
+    with pytest.raises(ChatGPTExportError) as caught:
+        export_chatgpt(
+            tmp_path / "out",
+            state,
+            source_input=Path("-"),
+            project_config=config,
+            full=False,
+            dry_run=False,
+            since_date=None,
+            stdin_text=json.dumps(snapshot),
+        )
+
+    assert "DISCOVERY PRIVATE CANARY" not in str(caught.value)
+    assert state == {"chatgpt": {"sessions": {}}}
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("observed_at", [None, "not-a-timestamp", "2026-08-27T12:00:00"])
+def test_live_envelope_rejects_invalid_observation_timestamp(
+    tmp_path: Path, observed_at: object
+) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    snapshot = live_snapshot()
+    snapshot["observed_at"] = observed_at
+
+    with pytest.raises(ChatGPTExportError, match="observed_at"):
+        export_chatgpt(
+            tmp_path / "out",
+            {"chatgpt": {"sessions": {}}},
+            source_input=Path("-"),
+            project_config=config,
+            full=False,
+            dry_run=False,
+            since_date=None,
+            stdin_text=json.dumps(snapshot),
+        )
+
+
+def test_live_envelope_rejects_malformed_project_without_parsing_body(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    snapshot = live_snapshot()
+    snapshot["projects"].append(
+        {"project_id": "not a safe id", "threads": {"private": "CANARY"}}
+    )
+
+    with pytest.raises(ChatGPTExportError) as caught:
+        export_chatgpt(
+            tmp_path / "out",
+            {"chatgpt": {"sessions": {}}},
+            source_input=Path("-"),
+            project_config=config,
+            full=False,
+            dry_run=False,
+            since_date=None,
+            stdin_text=json.dumps(snapshot),
+        )
+
+    assert "CANARY" not in str(caught.value)
+    assert not (tmp_path / "out").exists()
