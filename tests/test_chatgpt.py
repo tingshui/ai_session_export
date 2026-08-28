@@ -677,6 +677,35 @@ def test_full_export_cannot_regress_revision_before_a_branch_change(
     assert path.read_bytes() == original
 
 
+@pytest.mark.parametrize("revision", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_live_revision_cannot_overwrite_verified_state(
+    tmp_path: Path, revision: float
+) -> None:
+    state = {"chatgpt": {"sessions": {}}}
+    export_live(tmp_path, state, "Current live truth", updated_at=100)
+    path = next((tmp_path / "out" / "Approved_Project").glob("*.md"))
+    original = path.read_bytes()
+    snapshot = live_snapshot("Changed content with ambiguous revision")
+    snapshot["projects"][0]["threads"][0]["updated_at"] = revision
+
+    result = export_chatgpt(
+        tmp_path / "out",
+        state,
+        source_input=Path("-"),
+        project_config=tmp_path / "routing.json",
+        full=True,
+        dry_run=False,
+        since_date=None,
+        stdin_text=json.dumps(snapshot),
+    )
+
+    assert result["exported"] == 0
+    assert result["failed"] == 1
+    assert "authority is ambiguous" in result["warnings"][0]["error"]
+    assert state["chatgpt"]["sessions"]["thread-fixture"]["thread_updated_at"] == 100
+    assert path.read_bytes() == original
+
+
 def test_cli_persists_in_progress_before_official_archive_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

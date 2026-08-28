@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import zipfile
 from collections.abc import Callable
@@ -93,7 +94,8 @@ def _revision_number(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
     try:
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         if isinstance(value, str):
             try:
@@ -791,12 +793,19 @@ def export_chatgpt(
                 and incoming_revision is not None
                 and incoming_revision < previous_revision
             )
+            incoming_revision_is_ambiguous = (
+                previous_revision is not None and incoming_revision is None
+            )
             changed_branch_is_not_newer = branch_changed and (
                 previous_revision is None
                 or incoming_revision is None
                 or incoming_revision <= previous_revision
             )
-            if revision_regressed or changed_branch_is_not_newer:
+            if (
+                revision_regressed
+                or incoming_revision_is_ambiguous
+                or changed_branch_is_not_newer
+            ):
                 warnings.append(
                     {
                         "thread_id": conversation.record.session_id,
