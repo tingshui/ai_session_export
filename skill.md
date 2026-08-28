@@ -112,9 +112,10 @@ Antigravity emits `surface` as `"2"`, `"ide"`, or `"cli"`.
 | Second Mind | `./second_mind_export.json` | JSON |
 
 For ChatGPT live input, paginate each approved conversation to `hasMore=false`
-using the App's supported limits. Never label a response `full_history` if an
-item contains an App truncation sentinel; retain the previous Markdown/state
-and use an official export for recovery. When stdin is a terminal, the CLI
+using the App's supported limits. Incomplete user content fails closed and
+retains the previous Markdown/state. Assistant-only truncation may be archived
+only with explicit incomplete metadata and a visible warning marker; assistant
+text never becomes reflection evidence. When stdin is a terminal, the CLI
 disables echo while reading the one-line JSON snapshot.
 
 ## Adding a New Source

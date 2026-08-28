@@ -813,3 +813,93 @@ def test_live_envelope_rejects_malformed_project_without_parsing_body(
 
     assert "CANARY" not in str(caught.value)
     assert not (tmp_path / "out").exists()
+
+
+def test_live_warning_redacts_invalid_thread_identifier(tmp_path: Path) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    snapshot = live_snapshot()
+    snapshot["projects"][0]["threads"][0]["thread_id"] = (
+        "PRIVATE THREAD TITLE / MUST NOT LOG"
+    )
+
+    result = export_chatgpt(
+        tmp_path / "out",
+        {"chatgpt": {"sessions": {}}},
+        source_input=Path("-"),
+        project_config=config,
+        full=False,
+        dry_run=False,
+        since_date=None,
+        stdin_text=json.dumps(snapshot),
+    )
+
+    assert result["failed"] == 1
+    assert result["warnings"][0]["thread_id"] == "unknown"
+    assert "PRIVATE THREAD TITLE" not in json.dumps(result)
+
+
+def test_live_envelope_rejects_impossible_approved_pinned_count(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    snapshot = live_snapshot()
+    snapshot["discovery"]["approved_pinned_threads"] = 2
+
+    with pytest.raises(ChatGPTExportError, match="approved_pinned_threads"):
+        export_chatgpt(
+            tmp_path / "out",
+            {"chatgpt": {"sessions": {}}},
+            source_input=Path("-"),
+            project_config=config,
+            full=False,
+            dry_run=False,
+            since_date=None,
+            stdin_text=json.dumps(snapshot),
+        )
+
+
+def test_official_write_failure_rolls_back_archive_and_seed_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "routing.json"
+    write_config(config)
+    conversations = official_conversations()[:1]
+    second = json.loads(
+        json.dumps(conversations[0])
+        .replace("thread-fixture", "thread-second")
+        .replace("message-user", "message-user-second")
+        .replace("message-assistant", "message-assistant-second")
+    )
+    conversations.append(second)
+    source = tmp_path / "official.zip"
+    write_official_zip(source, conversations)
+    state_file = tmp_path / "state.json"
+    original_write = chatgpt_module._atomic_write_text
+    writes = 0
+
+    def fail_second_write(path: Path, content: str) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("synthetic second write failure")
+        original_write(path, content)
+
+    monkeypatch.setattr(chatgpt_module, "_atomic_write_text", fail_second_write)
+
+    with pytest.raises(OSError, match="second write failure"):
+        run_export(
+            "chatgpt",
+            full=False,
+            dry_run=False,
+            base_dir=tmp_path / "archive",
+            state_file=state_file,
+            chatgpt_input=source,
+            chatgpt_project_config=config,
+        )
+
+    assert list((tmp_path / "archive").rglob("*.md")) == []
+    persisted = load_state(state_file)
+    assert persisted["chatgpt"]["official_seed"] == {"status": "unused"}
+    assert persisted["chatgpt"]["sessions"] == {}

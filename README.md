@@ -71,9 +71,10 @@ IDs in `--chatgpt-project-config`, accepts either a transient Codex App snapshot
 stable Markdown file per current conversation branch under
 `chatgpt/<project-label>/`. It never discovers or exports Projectless chats.
 Live snapshots must prove full pagination; official exports are the historical
-reconciliation path. Codex App reads must use its documented per-page limits;
-if any item carries an App truncation sentinel, that conversation fails without
-overwriting its previous Markdown or state.
+reconciliation path. Codex App reads must use its documented per-page limits.
+Incomplete user content fails the conversation without overwriting its prior
+Markdown/state. Assistant-only truncation is retained only in the private
+archive with explicit incomplete metadata and a visible warning marker.
 
 ## Output Format
 

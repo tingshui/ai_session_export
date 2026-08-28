@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import sys
+from contextlib import contextmanager
 from collections.abc import Mapping
 from datetime import date
 from pathlib import Path
@@ -44,7 +46,7 @@ def _read_sensitive_stdin() -> str:
         termios.tcsetattr(fd, termios.TCSANOW, original)
 
 
-def run_export(
+def _run_export_unlocked(
     source: str,
     *,
     full: bool,
@@ -177,6 +179,30 @@ def run_export(
     if not dry_run:
         save_state(state, state_file)
     return results
+
+
+@contextmanager
+def _chatgpt_state_lock(state_file: Path):
+    lock_path = state_file.with_name(f"{state_file.name}.chatgpt.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def run_export(source: str, **kwargs: Any) -> list[dict[str, Any]]:
+    """Serialize ChatGPT archive/state writers across local processes."""
+    state_file = Path(kwargs.get("state_file", STATE_FILE))
+    uses_chatgpt = source == "chatgpt" or (
+        source == "all" and kwargs.get("chatgpt_input") is not None
+    )
+    if not uses_chatgpt:
+        return _run_export_unlocked(source, **kwargs)
+    with _chatgpt_state_lock(state_file):
+        return _run_export_unlocked(source, **kwargs)
 
 
 def parse_args() -> argparse.Namespace:

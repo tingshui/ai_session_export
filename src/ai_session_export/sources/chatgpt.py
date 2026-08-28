@@ -45,8 +45,13 @@ class ParsedChatGPTConversation(NamedTuple):
 def _require_id(value: Any, field: str) -> str:
     text = str(value or "").strip()
     if not SAFE_ID_RE.fullmatch(text):
-        raise ChatGPTExportError(f"invalid {field}: {text!r}")
+        raise ChatGPTExportError(f"invalid {field}")
     return text
+
+
+def _diagnostic_id(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if SAFE_ID_RE.fullmatch(text) else "unknown"
 
 
 def _sha256(text: str) -> str:
@@ -541,7 +546,7 @@ def parse_live_snapshot(
 
     returned = require_count("non_pinned_returned")
     limit = require_count("non_pinned_limit", positive=True)
-    require_count("approved_pinned_threads")
+    approved_pinned = require_count("approved_pinned_threads")
     if returned > limit:
         raise ChatGPTExportError(
             "live snapshot discovery non_pinned_returned exceeds non_pinned_limit"
@@ -584,6 +589,18 @@ def parse_live_snapshot(
         raise ChatGPTExportError(
             "live snapshot missing approved projects: " + ",".join(missing_projects)
         )
+    approved_thread_count = 0
+    for project_id, _label, project in approved_projects:
+        threads = project.get("threads")
+        if not isinstance(threads, list):
+            raise ChatGPTExportError(
+                f"approved project threads must be an array: {project_id}"
+            )
+        approved_thread_count += len(threads)
+    if approved_pinned > approved_thread_count:
+        raise ChatGPTExportError(
+            "approved_pinned_threads exceeds approved thread population"
+        )
 
     parsed: list[ParsedChatGPTConversation] = []
     warnings: list[dict[str, str]] = []
@@ -596,7 +613,9 @@ def parse_live_snapshot(
             if not isinstance(thread, dict):
                 warnings.append({"thread_id": "unknown", "error": "thread must be an object"})
                 continue
-            candidate_id = str(thread.get("thread_id") or thread.get("id") or "unknown")
+            candidate_id = _diagnostic_id(
+                thread.get("thread_id") or thread.get("id")
+            )
             try:
                 conversation = parse_live_thread(thread, project_id, label)
                 if conversation.record.session_id in seen_threads:
@@ -622,7 +641,7 @@ def parse_official_snapshot(
         if label is None:
             ignored += 1
             continue
-        candidate_id = str(
+        candidate_id = _diagnostic_id(
             conversation.get("conversation_id") or conversation.get("id") or "unknown"
         )
         try:
@@ -639,6 +658,17 @@ def _atomic_write_text(path: Path, content: str) -> None:
     temporary.replace(path)
     if path.read_text(encoding="utf-8") != content:
         raise ChatGPTExportError(f"Markdown reread verification failed: {path}")
+
+
+def _restore_archive_file(path: Path, previous: bytes | None) -> None:
+    if previous is None:
+        if path.exists():
+            path.unlink()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.rollback.tmp")
+    temporary.write_bytes(previous)
+    temporary.replace(path)
 
 
 def export_chatgpt(
@@ -736,6 +766,7 @@ def export_chatgpt(
 
     updated_sessions = dict(existing_sessions)
     exported = 0
+    official_writes: list[tuple[Path, str]] = []
 
     for conversation in parsed:
         if since_date and date.fromisoformat(conversation.record.date) < since_date:
@@ -793,7 +824,10 @@ def export_chatgpt(
             )
         rendered = render_markdown(conversation.record)
         if not dry_run:
-            _atomic_write_text(output_path, rendered)
+            if is_live:
+                _atomic_write_text(output_path, rendered)
+            else:
+                official_writes.append((output_path, rendered))
             updated_sessions[conversation.record.session_id] = {
                 "project_id": conversation.project_id,
                 "project_label": conversation.project_label,
@@ -808,6 +842,26 @@ def export_chatgpt(
                 "last_input_kind": conversation.input_kind,
             }
         exported += 1
+
+    if official_writes and not dry_run:
+        previous_files: list[tuple[Path, bytes | None]] = []
+        try:
+            for path, rendered in official_writes:
+                previous_files.append(
+                    (path, path.read_bytes() if path.is_file() else None)
+                )
+                _atomic_write_text(path, rendered)
+        except Exception:
+            for path, previous in reversed(previous_files):
+                _restore_archive_file(path, previous)
+            state["chatgpt"] = {
+                **source_state,
+                "sessions": dict(existing_sessions),
+                "official_seed": {"status": "unused"},
+            }
+            if checkpoint_state is not None:
+                checkpoint_state(state)
+            raise
 
     if not dry_run:
         final_state = {**source_state, "sessions": updated_sessions}
