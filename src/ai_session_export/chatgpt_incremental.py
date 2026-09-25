@@ -38,7 +38,11 @@ class ThreadPlan:
     created_at: float
     updated_at: float
     mode: Literal[
-        "incremental_tail", "new_thread", "historical_backfill", "window_preview"
+        "incremental_tail",
+        "legacy_reconcile",
+        "new_thread",
+        "historical_backfill",
+        "window_preview",
     ]
     anchor_message_id: str | None
     anchor_sha256: str | None
@@ -76,6 +80,7 @@ class ApplyResult:
 
 
 OBSERVER_HANDOFF_RETENTION = 90
+PRODUCER_TRIGGERS = {"manual_validation", "scheduled_automation"}
 
 
 def discovery_report(plan: DiscoveryPlan) -> dict[str, Any]:
@@ -205,6 +210,12 @@ def _epoch_seconds(value: Any) -> float | None:
 
 
 def _anchor(session_state: dict[str, Any]) -> tuple[str | None, str | None]:
+    live_anchor = session_state.get("live_anchor")
+    if isinstance(live_anchor, dict):
+        message_id = _safe_id(live_anchor.get("message_id"))
+        digest = str(live_anchor.get("content_sha256") or "").strip().lower()
+        if message_id and re.fullmatch(r"[0-9a-f]{64}", digest):
+            return message_id, digest
     messages = session_state.get("messages")
     if not isinstance(messages, list):
         return None, None
@@ -266,6 +277,25 @@ def plan_incremental_threads(
             prior_updated_at = _revision_number(prior.get("thread_updated_at"))
             if prior_updated_at is not None and updated_at <= prior_updated_at:
                 unchanged += 1
+                continue
+            legacy_import = prior.get("legacy_import")
+            if isinstance(legacy_import, dict) and not legacy_import.get(
+                "native_ids_reconciled"
+            ):
+                changed.append(
+                    ThreadPlan(
+                        thread_id=thread_id,
+                        project_id=project_id,
+                        project_label=approved_projects[project_id],
+                        title=str(summary.get("title") or "Untitled"),
+                        created_at=created_at,
+                        updated_at=updated_at,
+                        mode="legacy_reconcile",
+                        anchor_message_id=None,
+                        anchor_sha256=None,
+                        output_file=str(prior.get("output_file") or "") or None,
+                    )
+                )
                 continue
             anchor_message_id, anchor_sha256 = _anchor(prior)
             if anchor_message_id is None:
@@ -566,6 +596,8 @@ def _observer_handoff(
     *,
     observed_at: str,
     status: Literal["success", "partial_failure"],
+    producer_trigger: str,
+    discovery_saturated: bool | None,
 ) -> dict[str, Any]:
     """Append one raw-text-free, generation-ordered Observer handoff."""
 
@@ -578,12 +610,20 @@ def _observer_handoff(
         not isinstance(item, dict) for item in existing
     ):
         raise ChatGPTIncrementalError("invalid observer_handoffs")
+    if producer_trigger not in PRODUCER_TRIGGERS:
+        raise ChatGPTIncrementalError("invalid producer_trigger")
+    if discovery_saturated is not None and not isinstance(
+        discovery_saturated, bool
+    ):
+        raise ChatGPTIncrementalError("invalid handoff discovery_saturated")
     material = {
         "schema_version": 1,
         "archive_generation": generation,
         "previous_generation": generation_value,
         "observed_at": observed_at,
         "status": status,
+        "producer_trigger": producer_trigger,
+        "discovery_saturated": discovery_saturated,
         "zero_user_delta": not any(
             change.get("user_messages") for change in changes
         ),
@@ -676,6 +716,74 @@ def _restore_file(path: Path, previous: bytes | None) -> None:
     temporary.replace(path)
 
 
+def _message_content_key(message: MessageTurn) -> tuple[str, str]:
+    return message.role, content_sha256(message.content)
+
+
+def _reuse_legacy_message_ids(
+    legacy_messages: list[MessageTurn], live_messages: list[MessageTurn]
+) -> tuple[list[MessageTurn], int]:
+    """Reuse stable archive IDs for the longest unchanged legacy subsequence."""
+
+    legacy_keys = [_message_content_key(message) for message in legacy_messages]
+    live_keys = [_message_content_key(message) for message in live_messages]
+    rows = len(legacy_keys) + 1
+    columns = len(live_keys) + 1
+    lengths = [[0] * columns for _ in range(rows)]
+    for legacy_index in range(1, rows):
+        for live_index in range(1, columns):
+            if legacy_keys[legacy_index - 1] == live_keys[live_index - 1]:
+                lengths[legacy_index][live_index] = (
+                    lengths[legacy_index - 1][live_index - 1] + 1
+                )
+            else:
+                lengths[legacy_index][live_index] = max(
+                    lengths[legacy_index - 1][live_index],
+                    lengths[legacy_index][live_index - 1],
+                )
+
+    matches: dict[int, int] = {}
+    legacy_index = len(legacy_keys)
+    live_index = len(live_keys)
+    while legacy_index and live_index:
+        if legacy_keys[legacy_index - 1] == live_keys[live_index - 1]:
+            matches[live_index - 1] = legacy_index - 1
+            legacy_index -= 1
+            live_index -= 1
+        elif lengths[legacy_index - 1][live_index] >= lengths[legacy_index][live_index - 1]:
+            legacy_index -= 1
+        else:
+            live_index -= 1
+
+    merged = list(live_messages)
+    for current_index, prior_index in matches.items():
+        merged[current_index] = merged[current_index]._replace(
+            message_id=legacy_messages[prior_index].message_id
+        )
+    return merged, len(legacy_messages) - len(matches)
+
+
+def _live_authority_tail(
+    messages: list[MessageTurn], source_state: dict[str, Any], thread_id: str
+) -> tuple[list[MessageTurn], MessageTurn | None]:
+    boundary = _epoch_ms(source_state.get("live_authority_started_at"))
+    if boundary is None:
+        raise ChatGPTIncrementalError(
+            f"legacy branch reconciliation lacks live authority boundary: {thread_id}"
+        )
+    first_new = len(messages)
+    for index, message in enumerate(messages):
+        if message.time_created is None:
+            raise ChatGPTIncrementalError(
+                f"legacy branch reconciliation lacks message timestamp: {thread_id}"
+            )
+        if message.time_created >= boundary:
+            first_new = index
+            break
+    prior_anchor = messages[first_new - 1] if first_new else None
+    return messages[first_new:], prior_anchor
+
+
 def apply_incremental_batch(
     output_dir: Path,
     source_state: dict[str, Any],
@@ -683,6 +791,8 @@ def apply_incremental_batch(
     *,
     observed_at: str,
     handoff_status: Literal["success", "partial_failure"] = "success",
+    producer_trigger: str = "manual_validation",
+    discovery_saturated: bool | None = None,
     checkpoint_state: Callable[[dict[str, Any]], None] | None = None,
 ) -> ApplyResult:
     """Atomically apply verified tails, then advance the source checkpoint."""
@@ -709,6 +819,41 @@ def apply_incremental_batch(
             relative = str(prior.get("output_file") or plan.output_file or "")
             output_path = _archive_path(output_dir, relative)
             old_messages = _existing_messages(output_path, prior)
+            new_messages = tail.messages
+            merged = old_messages + new_messages
+            prior_anchor = old_messages[-1] if old_messages else None
+        elif plan.mode == "legacy_reconcile":
+            if prior is None or tail.terminal_reason != "end":
+                raise ChatGPTIncrementalError(
+                    f"legacy reconciliation lacks terminal history: {plan.thread_id}"
+                )
+            relative = str(prior.get("output_file") or plan.output_file or "")
+            output_path = _archive_path(output_dir, relative)
+            old_messages = _existing_messages(output_path, prior)
+            live_messages = tail.messages
+            if not live_messages:
+                raise ChatGPTIncrementalError(
+                    f"legacy reconciliation returned empty live history: {plan.thread_id}"
+                )
+            exact_prefix = len(live_messages) >= len(old_messages) and all(
+                _message_content_key(legacy_message)
+                == _message_content_key(live_message)
+                for legacy_message, live_message in zip(old_messages, live_messages)
+            )
+            if exact_prefix:
+                merged = old_messages + live_messages[len(old_messages):]
+                new_messages = live_messages[len(old_messages):]
+                prior_anchor = old_messages[-1] if old_messages else None
+                legacy_reconciliation = "exact_prefix"
+                legacy_messages_removed = 0
+            else:
+                merged, legacy_messages_removed = _reuse_legacy_message_ids(
+                    old_messages, live_messages
+                )
+                new_messages, prior_anchor = _live_authority_tail(
+                    merged, source_state, plan.thread_id
+                )
+                legacy_reconciliation = "live_authority_branch"
         else:
             terminal_is_valid = tail.terminal_reason == "end" or (
                 plan.mode == "window_preview" and tail.terminal_reason == "cutoff"
@@ -727,13 +872,14 @@ def apply_incremental_batch(
             )
             relative = output_path.relative_to(output_dir).as_posix()
             old_messages = []
+            new_messages = tail.messages
+            merged = new_messages
+            prior_anchor = None
         reserved_paths.add(output_path)
 
-        old_ids = {message.message_id for message in old_messages}
-        new_ids = [message.message_id for message in tail.messages]
-        if len(new_ids) != len(set(new_ids)) or old_ids.intersection(new_ids):
+        merged_ids = [message.message_id for message in merged]
+        if len(merged_ids) != len(set(merged_ids)):
             raise ChatGPTIncrementalError(f"duplicate message during merge: {plan.thread_id}")
-        merged = old_messages + tail.messages
         metadata = _message_metadata(merged)
         record_started_at = (
             merged[0].time_created / 1000
@@ -765,10 +911,36 @@ def apply_incremental_batch(
             "user_complete": all(m.complete for m in merged if m.role == "user"),
             "assistant_complete": all(m.complete for m in merged if m.role == "assistant"),
             "last_seen_at": observed_at,
-            "last_input_kind": "app_incremental",
+            "last_input_kind": (
+                "app_legacy_reconcile"
+                if plan.mode == "legacy_reconcile"
+                else "app_incremental"
+            ),
         }
+        if plan.mode == "legacy_reconcile":
+            legacy_import = deepcopy(prior.get("legacy_import"))
+            legacy_import["native_ids_reconciled"] = True
+            legacy_import["reconciled_at"] = observed_at
+            legacy_import["live_message_count"] = len(merged)
+            legacy_import["reconciliation"] = legacy_reconciliation
+            legacy_import["legacy_messages_removed"] = legacy_messages_removed
+            staged_session["legacy_import"] = legacy_import
+            live_anchor_message = live_messages[-1]
+            staged_session["live_anchor"] = {
+                "message_id": live_anchor_message.message_id,
+                "content_sha256": content_sha256(live_anchor_message.content),
+            }
+        elif prior is not None and isinstance(prior.get("legacy_import"), dict):
+            staged_session["legacy_import"] = deepcopy(prior["legacy_import"])
+            if new_messages:
+                live_anchor_message = new_messages[-1]
+                staged_session["live_anchor"] = {
+                    "message_id": live_anchor_message.message_id,
+                    "content_sha256": content_sha256(live_anchor_message.content),
+                }
+            elif isinstance(prior.get("live_anchor"), dict):
+                staged_session["live_anchor"] = deepcopy(prior["live_anchor"])
         staged_sessions[plan.thread_id] = staged_session
-        prior_anchor = old_messages[-1] if old_messages else None
         handoff_changes.append(
             {
                 "project_id": plan.project_id,
@@ -801,7 +973,7 @@ def apply_incremental_batch(
                         "created_at": message.time_created,
                         "change": "new",
                     }
-                    for message in tail.messages
+                    for message in new_messages
                     if message.role == "user"
                 ],
             }
@@ -812,6 +984,8 @@ def apply_incremental_batch(
         handoff_changes,
         observed_at=observed_at,
         status=handoff_status,
+        producer_trigger=producer_trigger,
+        discovery_saturated=discovery_saturated,
     )
 
     previous_files = [
@@ -843,6 +1017,7 @@ def apply_incremental_payload(
     payload: dict[str, Any],
     *,
     historical_backfill: bool = False,
+    producer_trigger: str = "manual_validation",
     window_since_at: float | None = None,
     window_until_at: float | None = None,
     checkpoint_state: Callable[[dict[str, Any]], None] | None = None,
@@ -921,12 +1096,33 @@ def apply_incremental_payload(
         except ChatGPTIncrementalError as error:
             warnings.append({"thread_id": plan.thread_id, "error": str(error)})
 
+    # Page collection is a batch-level precondition.  A successful tail must
+    # not be committed while another planned thread is still missing terminal
+    # proof: doing so advances only part of the discovery snapshot and leaves
+    # the next run with a mixed generation.  Return the complete warning set
+    # without touching Markdown, source state, generation, or handoffs.
+    if warnings:
+        return {
+            "source": "chatgpt",
+            "scanned": len(summaries),
+            "exported": 0,
+            "failed": len(warnings),
+            "ignored": discovery.ignored,
+            "unchanged": discovery.unchanged,
+            "backfill_pending": len(discovery.needs_backfill),
+            "discovery_saturated": saturated,
+            "warnings": warnings,
+            "output_paths": [],
+            "observer_handoff": None,
+        }
+
     apply_result = apply_incremental_batch(
         output_dir,
         source_state,
         successful,
         observed_at=observed_at,
-        handoff_status="partial_failure" if warnings else "success",
+        producer_trigger=producer_trigger,
+        discovery_saturated=saturated,
         checkpoint_state=checkpoint_state,
     )
     return {

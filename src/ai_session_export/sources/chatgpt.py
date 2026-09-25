@@ -12,6 +12,7 @@ from typing import Any, NamedTuple
 
 from ..markdown import render_markdown
 from ..models import MessageTurn, SessionRecord
+from ..state import assert_chatgpt_state_local
 from ..utils import sanitize_filename, unique_output_path
 
 
@@ -686,6 +687,7 @@ def export_chatgpt(
     stdin_text: str | None = None,
     checkpoint_state: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    assert_chatgpt_state_local(state)
     allowlist = load_project_allowlist(project_config)
     is_live = str(source_input) == "-"
     source_state = state.get("chatgpt", {})

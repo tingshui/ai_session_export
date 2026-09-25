@@ -131,6 +131,86 @@ def test_plan_reads_only_changed_threads_and_separates_backfill() -> None:
     assert result.ignored == 2
 
 
+def test_plan_uses_full_history_reconciliation_for_legacy_import() -> None:
+    source_state = {
+        "sessions": {
+            "legacy": {
+                "thread_updated_at": 200,
+                "output_file": "Approved/legacy.md",
+                "legacy_import": {"imported_at": "2026-08-28T12:00:00Z"},
+                "messages": [{
+                    "message_id": "synthetic-anchor",
+                    "role": "assistant",
+                    "created_at": 190,
+                    "content_sha256": "a" * 64,
+                    "complete": True,
+                }],
+            }
+        }
+    }
+
+    result = plan_incremental_threads(
+        [{
+            "id": "legacy",
+            "kind": "chatgpt",
+            "projectId": PROJECT_ID,
+            "title": "Legacy",
+            "createdAt": 100,
+            "updatedAt": 201,
+        }],
+        source_state,
+        {PROJECT_ID: "Approved"},
+    )
+
+    assert len(result.changed) == 1
+    assert result.changed[0].mode == "legacy_reconcile"
+    assert result.changed[0].anchor_message_id is None
+    assert result.changed[0].anchor_sha256 is None
+
+
+def test_plan_uses_native_live_anchor_after_legacy_archive_id_preservation() -> None:
+    source_state = {
+        "sessions": {
+            "legacy": {
+                "thread_updated_at": 200,
+                "output_file": "Approved/legacy.md",
+                "legacy_import": {
+                    "imported_at": "2026-08-28T12:00:00Z",
+                    "native_ids_reconciled": True,
+                },
+                "live_anchor": {
+                    "message_id": "native-live-anchor",
+                    "content_sha256": "b" * 64,
+                },
+                "messages": [{
+                    "message_id": "synthetic-archive-anchor",
+                    "role": "assistant",
+                    "created_at": 190,
+                    "content_sha256": "a" * 64,
+                    "complete": True,
+                }],
+            }
+        }
+    }
+
+    result = plan_incremental_threads(
+        [{
+            "id": "legacy",
+            "kind": "chatgpt",
+            "projectId": PROJECT_ID,
+            "title": "Legacy",
+            "createdAt": 100,
+            "updatedAt": 201,
+        }],
+        source_state,
+        {PROJECT_ID: "Approved"},
+    )
+
+    assert result.changed[0].mode == "incremental_tail"
+    assert result.changed[0].anchor_message_id == "native-live-anchor"
+    assert result.changed[0].anchor_sha256 == "b" * 64
+
+
 def test_collect_stops_on_exact_anchor_without_reading_older_pages() -> None:
     plan = ThreadPlan(
         thread_id="changed",
@@ -499,9 +579,397 @@ def test_payload_orchestrator_reads_only_planned_threads(tmp_path) -> None:
     assert result["observer_handoff"]["archive_generation"] == 1
     assert result["observer_handoff"]["status"] == "success"
     assert result["observer_handoff"]["zero_user_delta"] is False
+    assert result["observer_handoff"]["discovery_saturated"] is True
     assert "hello" not in json.dumps(
         result["observer_handoff"], ensure_ascii=False
     )
+
+
+def test_payload_does_not_partially_apply_when_any_page_chain_is_incomplete(
+    tmp_path,
+) -> None:
+    output_dir = tmp_path / "chatgpt"
+    sessions = {}
+    before_files = {}
+    for thread_id in ("complete", "incomplete"):
+        output_file = f"Approved/{thread_id}.md"
+        output_path = output_dir / output_file
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        anchor = MessageTurn(
+            "assistant",
+            f"old answer {thread_id}",
+            110_000,
+            message_id=f"anchor-{thread_id}",
+        )
+        output_path.write_text(
+            render_markdown(
+                SessionRecord(
+                    "chatgpt",
+                    thread_id,
+                    thread_id.title(),
+                    "1970-01-01",
+                    [anchor],
+                )
+            ),
+            encoding="utf-8",
+        )
+        before_files[thread_id] = output_path.read_bytes()
+        sessions[thread_id] = {
+            "project_id": PROJECT_ID,
+            "project_label": "Approved",
+            "output_file": output_file,
+            "thread_updated_at": 200,
+            "messages": [{
+                "message_id": anchor.message_id,
+                "role": anchor.role,
+                "created_at": anchor.time_created,
+                "content_sha256": content_sha256(anchor.content),
+                "complete": True,
+            }],
+        }
+
+    source_state = {"sessions": sessions}
+    before_state = json.loads(json.dumps(source_state))
+    payload = {
+        "schema_version": 2,
+        "observed_at": "2026-08-30T12:00:00Z",
+        "discovery": {
+            "non_pinned_returned": 2,
+            "non_pinned_limit": 50,
+            "recent_window_saturated": False,
+        },
+        "summaries": [
+            {
+                "id": thread_id,
+                "kind": "chatgpt",
+                "projectId": PROJECT_ID,
+                "title": thread_id.title(),
+                "createdAt": 100,
+                "updatedAt": 201,
+            }
+            for thread_id in ("complete", "incomplete")
+        ],
+        "pages": {
+            "complete": [{
+                "thread_id": "complete",
+                "cursor_in": None,
+                "cursor_out": "older-complete",
+                "has_more": True,
+                "messages": [{
+                    "id": "new-complete",
+                    "role": "user",
+                    "content": "new complete message",
+                    "created_at": 200_000,
+                    "complete": True,
+                }],
+            }, {
+                "thread_id": "complete",
+                "cursor_in": "older-complete",
+                "cursor_out": None,
+                "has_more": False,
+                "messages": [{
+                    "id": "anchor-complete",
+                    "role": "assistant",
+                    "content": "old answer complete",
+                    "created_at": 110_000,
+                    "complete": True,
+                }],
+            }],
+            "incomplete": [{
+                "thread_id": "incomplete",
+                "cursor_in": None,
+                "cursor_out": "older-incomplete",
+                "has_more": True,
+                "messages": [{
+                    "id": "new-incomplete",
+                    "role": "user",
+                    "content": "new incomplete message",
+                    "created_at": 200_000,
+                    "complete": True,
+                }],
+            }],
+        },
+    }
+
+    result = apply_incremental_payload(
+        output_dir,
+        source_state,
+        {PROJECT_ID: "Approved"},
+        payload,
+    )
+
+    assert result["exported"] == 0
+    assert result["failed"] == 1
+    assert result["output_paths"] == []
+    assert result["observer_handoff"] is None
+    assert source_state == before_state
+    for thread_id in ("complete", "incomplete"):
+        path = output_dir / f"Approved/{thread_id}.md"
+        assert path.read_bytes() == before_files[thread_id]
+
+
+def test_legacy_reconcile_preserves_archive_ids_and_emits_only_live_tail(
+    tmp_path,
+) -> None:
+    output_dir = tmp_path / "chatgpt"
+    output_path = output_dir / "Approved/legacy.md"
+    output_path.parent.mkdir(parents=True)
+    legacy_messages = [
+        MessageTurn("user", "old question", 100_000, message_id="synthetic-user"),
+        MessageTurn(
+            "assistant", "old answer", 101_000, message_id="synthetic-assistant"
+        ),
+    ]
+    output_path.write_text(
+        render_markdown(
+            SessionRecord(
+                "chatgpt", "legacy", "Legacy", "1970-01-01", legacy_messages
+            )
+        ),
+        encoding="utf-8",
+    )
+    source_state = {
+        "sessions": {
+            "legacy": {
+                "project_id": PROJECT_ID,
+                "project_label": "Approved",
+                "output_file": "Approved/legacy.md",
+                "thread_updated_at": 200,
+                "coverage": "full_history",
+                "messages": [
+                    {
+                        "message_id": message.message_id,
+                        "role": message.role,
+                        "created_at": message.time_created,
+                        "content_sha256": content_sha256(message.content),
+                        "complete": True,
+                    }
+                    for message in legacy_messages
+                ],
+                "legacy_import": {
+                    "imported_at": "2026-08-28T12:00:00Z",
+                    "message_count": 2,
+                },
+            }
+        }
+    }
+    payload = {
+        "schema_version": 2,
+        "observed_at": "2026-08-30T12:00:00Z",
+        "discovery": {
+            "non_pinned_returned": 1,
+            "non_pinned_limit": 50,
+            "recent_window_saturated": False,
+        },
+        "summaries": [{
+            "id": "legacy",
+            "kind": "chatgpt",
+            "projectId": PROJECT_ID,
+            "title": "Legacy",
+            "createdAt": 100,
+            "updatedAt": 201,
+        }],
+        "pages": {
+            "legacy": [{
+                "thread_id": "legacy",
+                "cursor_in": None,
+                "cursor_out": None,
+                "has_more": False,
+                "messages": [
+                    {
+                        "id": "live-new-assistant",
+                        "role": "assistant",
+                        "content": "new answer",
+                        "created_at": 301_000,
+                        "complete": True,
+                    },
+                    {
+                        "id": "live-new-user",
+                        "role": "user",
+                        "content": "new question",
+                        "created_at": 300_000,
+                        "complete": True,
+                    },
+                    {
+                        "id": "live-old-assistant",
+                        "role": "assistant",
+                        "content": "old answer",
+                        "created_at": 201_000,
+                        "complete": True,
+                    },
+                    {
+                        "id": "live-old-user",
+                        "role": "user",
+                        "content": "old question",
+                        "created_at": 200_000,
+                        "complete": True,
+                    },
+                ],
+            }]
+        },
+    }
+
+    result = apply_incremental_payload(
+        output_dir,
+        source_state,
+        {PROJECT_ID: "Approved"},
+        payload,
+    )
+
+    assert result["failed"] == 0
+    assert result["exported"] == 1
+    assert [
+        message.message_id for message in parse_marked_markdown(output_path)
+    ] == [
+        "synthetic-user",
+        "synthetic-assistant",
+        "live-new-user",
+        "live-new-assistant",
+    ]
+    stored = source_state["sessions"]["legacy"]
+    assert stored["thread_updated_at"] == 201
+    assert stored["legacy_import"]["native_ids_reconciled"] is True
+    assert stored["live_anchor"] == {
+        "message_id": "live-new-assistant",
+        "content_sha256": content_sha256("new answer"),
+    }
+    change = result["observer_handoff"]["changes"][0]
+    assert change["start_after"] == {
+        "message_id": "synthetic-assistant",
+        "content_sha256": content_sha256("old answer"),
+    }
+    assert change["user_messages"] == [{
+        "message_id": "live-new-user",
+        "content_sha256": content_sha256("new question"),
+        "created_at": 300_000_000,
+        "change": "new",
+    }]
+
+
+def test_legacy_reconcile_live_authority_rewrites_divergent_branch_without_replaying_history(
+    tmp_path,
+) -> None:
+    output_dir = tmp_path / "chatgpt"
+    output_path = output_dir / "Approved/divergent.md"
+    output_path.parent.mkdir(parents=True)
+    legacy_messages = [
+        MessageTurn("user", "shared question", 100_000, message_id="synthetic-user"),
+        MessageTurn("assistant", "legacy answer", 101_000, message_id="synthetic-assistant"),
+    ]
+    output_path.write_text(
+        render_markdown(
+            SessionRecord(
+                "chatgpt", "divergent", "Divergent", "1970-01-01", legacy_messages
+            )
+        ),
+        encoding="utf-8",
+    )
+    source_state = {
+        "live_authority_started_at": "2026-08-28T14:17:44Z",
+        "sessions": {
+            "divergent": {
+                "project_id": PROJECT_ID,
+                "project_label": "Approved",
+                "output_file": "Approved/divergent.md",
+                "thread_updated_at": 200,
+                "coverage": "full_history",
+                "messages": [
+                    {
+                        "message_id": message.message_id,
+                        "role": message.role,
+                        "created_at": message.time_created,
+                        "content_sha256": content_sha256(message.content),
+                        "complete": True,
+                    }
+                    for message in legacy_messages
+                ],
+                "legacy_import": {
+                    "imported_at": "2026-08-28T12:00:00Z",
+                    "message_count": 2,
+                },
+            }
+        },
+    }
+    payload = {
+        "schema_version": 2,
+        "observed_at": "2026-08-30T12:00:00Z",
+        "summaries": [{
+            "id": "divergent",
+            "kind": "chatgpt",
+            "projectId": PROJECT_ID,
+            "title": "Divergent",
+            "createdAt": 100,
+            "updatedAt": 201,
+        }],
+        "pages": {
+            "divergent": [{
+                "thread_id": "divergent",
+                "cursor_in": None,
+                "cursor_out": None,
+                "has_more": False,
+                "messages": [
+                    {
+                        "id": "live-new-assistant",
+                        "role": "assistant",
+                        "content": "new answer",
+                        "created_at": 1_788_061_621,
+                        "complete": True,
+                    },
+                    {
+                        "id": "live-new-user",
+                        "role": "user",
+                        "content": "new question",
+                        "created_at": 1_788_061_620,
+                        "complete": True,
+                    },
+                    {
+                        "id": "live-edited-assistant",
+                        "role": "assistant",
+                        "content": "current answer",
+                        "created_at": 101,
+                        "complete": True,
+                    },
+                    {
+                        "id": "live-old-user",
+                        "role": "user",
+                        "content": "shared question",
+                        "created_at": 100,
+                        "complete": True,
+                    },
+                ],
+            }]
+        },
+    }
+
+    result = apply_incremental_payload(
+        output_dir,
+        source_state,
+        {PROJECT_ID: "Approved"},
+        payload,
+    )
+
+    assert result["failed"] == 0
+    assert [message.message_id for message in parse_marked_markdown(output_path)] == [
+        "synthetic-user",
+        "live-edited-assistant",
+        "live-new-user",
+        "live-new-assistant",
+    ]
+    stored = source_state["sessions"]["divergent"]
+    assert stored["legacy_import"]["reconciliation"] == "live_authority_branch"
+    assert stored["legacy_import"]["legacy_messages_removed"] == 1
+    assert stored["live_anchor"]["message_id"] == "live-new-assistant"
+    change = result["observer_handoff"]["changes"][0]
+    assert change["start_after"] == {
+        "message_id": "live-edited-assistant",
+        "content_sha256": content_sha256("current answer"),
+    }
+    assert change["user_messages"] == [{
+        "message_id": "live-new-user",
+        "content_sha256": content_sha256("new question"),
+        "created_at": 1_788_061_620_000,
+        "change": "new",
+    }]
 
 
 def test_apply_emits_contiguous_zero_delta_generations(tmp_path) -> None:
@@ -518,14 +986,17 @@ def test_apply_emits_contiguous_zero_delta_generations(tmp_path) -> None:
         source_state,
         [],
         observed_at="2026-08-29T12:00:00Z",
+        producer_trigger="scheduled_automation",
     )
 
     assert first.observer_handoff["archive_generation"] == 1
     assert first.observer_handoff["previous_generation"] == 0
     assert first.observer_handoff["zero_user_delta"] is True
     assert first.observer_handoff["changes"] == []
+    assert first.observer_handoff["producer_trigger"] == "manual_validation"
     assert second.observer_handoff["archive_generation"] == 2
     assert second.observer_handoff["previous_generation"] == 1
+    assert second.observer_handoff["producer_trigger"] == "scheduled_automation"
     assert source_state["archive_generation"] == 2
 
 

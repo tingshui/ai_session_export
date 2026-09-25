@@ -14,7 +14,7 @@ from .sources.claude_code import DEFAULT_CLAUDE_HISTORY_FILES, DEFAULT_CLAUDE_PR
 from .sources.codex import DEFAULT_CODEX_SESSION_DIRS, DEFAULT_CODEX_SESSION_INDEX
 from .sources.cursor import DEFAULT_CURSOR_DB
 from .sources.dsh import DEFAULT_DSH_SESSIONS_DIR
-from .state import load_state, save_state
+from .state import assert_chatgpt_state_local, load_state, save_state
 from .utils import date_from_cli
 
 
@@ -68,7 +68,9 @@ def _run_export_unlocked(
     cursor_db: Path = DEFAULT_CURSOR_DB,
     dsh_sessions_dir: Path = DEFAULT_DSH_SESSIONS_DIR,
 ) -> list[dict[str, Any]]:
-    state = load_state(state_file)
+    state = load_state(state_file, sources=("chatgpt",) if source == "chatgpt" else None)
+    if source == "chatgpt" or (source == "all" and chatgpt_input is not None):
+        assert_chatgpt_state_local(state)
     results: list[dict[str, Any]] = []
 
     if source in {"second-mind", "all"}:

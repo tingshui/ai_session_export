@@ -1,5 +1,30 @@
 ## Changelog
 
+### 2026-09-08 — Isolated ChatGPT checkpoint ownership
+
+- Added strict ChatGPT-only checkpoint I/O and a dry-run-first state splitter:
+  `python -m ai_session_export.chatgpt_state --archive-root /path/to/archive`;
+  add `--apply` only after updating all ChatGPT consumers and arranging the
+  narrow archive-directory writer workspace. The dedicated checkpoint is
+  `chatgpt/.pipeline/export_state.json`; code need not move into that directory.
+- The split holds the legacy and dedicated writer locks, preserves the entire
+  existing ChatGPT state (generation, message hashes, and Observer handoffs),
+  and leaves every other source's JSON value unchanged. A ChatGPT-only hashed
+  backup and pending/complete relocation marker make interrupted transitions
+  restartable without baseline resets or replaying old receipts.
+- Retired ChatGPT entrypoints reject the shared checkpoint before archive
+  writes. Other local exporters continue using the shared file, while stale
+  state saves cannot erase the relocation marker or resurrect old ChatGPT data.
+- No Markdown files, production state, or scheduler configuration are changed
+  by installing this code or running the default dry-run command.
+
+### 2026-08-30 — Scheduled producer identity
+
+- ChatGPT apply now records whether a handoff came from manual validation or
+  the scheduled automation. The producer trigger participates in the handoff
+  run ID, allowing downstream consumers to bind scheduler health to the exact
+  scheduled archive run instead of any success from the same day.
+
 ### 2026-08-28 — Observer generation handoff
 
 - ChatGPT `apply` now advances a durable `archive_generation` and appends a

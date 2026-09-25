@@ -22,7 +22,7 @@ from .chatgpt_incremental import (
 from .markdown import render_markdown
 from .models import MessageTurn, SessionRecord
 from .sources.chatgpt import load_project_allowlist
-from .state import save_state
+from .state import assert_chatgpt_state_local, save_state
 from .utils import unique_output_path
 
 
@@ -382,6 +382,7 @@ def plan_legacy_import(
     timezone_name: str,
     observed_at: str,
 ) -> LegacyImportPlan:
+    assert_chatgpt_state_local(state)
     approved = load_project_allowlist(config_path)
     labels = sorted(approved.values())
     if len(labels) != len(set(labels)):

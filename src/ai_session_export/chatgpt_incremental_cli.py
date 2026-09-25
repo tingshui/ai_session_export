@@ -20,7 +20,7 @@ from .chatgpt_incremental import (
     plan_window_threads,
 )
 from .cli import BASE_DIR, STATE_FILE, _read_sensitive_stdin, _state_write_lock
-from .state import load_state, save_state
+from .state import assert_chatgpt_state_local, load_state, save_state
 
 
 def _payload() -> dict[str, Any]:
@@ -62,6 +62,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-dir", type=Path, default=BASE_DIR)
     parser.add_argument("--state-file", type=Path, default=STATE_FILE)
     parser.add_argument("--chatgpt-project-config", type=Path, required=True)
+    parser.add_argument(
+        "--producer-trigger",
+        choices=("manual_validation", "scheduled_automation"),
+        default="manual_validation",
+        help="Bind the Observer handoff to its actual caller provenance.",
+    )
     parser.add_argument("--at", help="Timezone-aware activation timestamp for activate-live.")
     parser.add_argument("--since-at", help="Timezone-aware lower bound for window actions.")
     parser.add_argument(
@@ -102,7 +108,8 @@ def run(
     if args.action in {"plan", "backfill-plan", "window-plan"}:
         if payload is None:
             raise ChatGPTIncrementalError("plan requires an input payload")
-        state = load_state(args.state_file)
+        state = load_state(args.state_file, sources=("chatgpt",))
+        assert_chatgpt_state_local(state)
         if args.action == "window-plan":
             plan = plan_window_threads(
                 _summaries(payload),
@@ -122,7 +129,8 @@ def run(
         return 0, report
 
     with _state_write_lock(args.state_file):
-        state = load_state(args.state_file)
+        state = load_state(args.state_file, sources=("chatgpt",))
+        assert_chatgpt_state_local(state)
         source_state = state["chatgpt"]
         if args.action == "activate-live":
             if not args.at:
@@ -148,6 +156,7 @@ def run(
             source_state,
             approved,
             payload,
+            producer_trigger=args.producer_trigger,
             historical_backfill=args.action == "backfill-apply",
             window_since_at=(
                 _since_seconds(args.since_at)

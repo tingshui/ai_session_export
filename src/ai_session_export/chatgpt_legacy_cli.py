@@ -14,7 +14,7 @@ from .chatgpt_legacy import (
     plan_legacy_import,
 )
 from .cli import BASE_DIR, STATE_FILE, _state_write_lock
-from .state import load_state
+from .state import assert_chatgpt_state_local, load_state
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,7 +32,8 @@ def parse_args() -> argparse.Namespace:
 def run(args: argparse.Namespace) -> dict[str, object]:
     observed_at = datetime.now(ZoneInfo(args.timezone)).isoformat()
     if not args.apply:
-        state = load_state(args.state_file)
+        state = load_state(args.state_file, sources=("chatgpt",))
+        assert_chatgpt_state_local(state)
         plan = plan_legacy_import(
             args.base_dir / "chatgpt",
             state,
@@ -42,7 +43,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         )
         return import_report(plan, applied=False)
     with _state_write_lock(args.state_file):
-        state = load_state(args.state_file)
+        state = load_state(args.state_file, sources=("chatgpt",))
+        assert_chatgpt_state_local(state)
         plan = plan_legacy_import(
             args.base_dir / "chatgpt",
             state,
