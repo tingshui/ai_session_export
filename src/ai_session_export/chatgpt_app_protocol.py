@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from .archive import content_sha256
-from .chatgpt_incremental import ChatGPTIncrementalError, ThreadPlan
+from .chatgpt_incremental import ChatGPTIncrementalError, ThreadPlan, anchor_matches
 
 
 PROTOCOL_SCHEMA_VERSION = 1
@@ -250,12 +251,17 @@ def normalize_page(
     }
 
 
-def page_is_terminal(plan: ThreadPlan, page: dict[str, Any]) -> bool:
+def page_is_terminal(
+    plan: ThreadPlan,
+    page: dict[str, Any],
+    *,
+    archive_root: Path | None = None,
+) -> bool:
     if plan.mode == "incremental_tail":
         for message in page.get("messages", []):
             if message.get("id") != plan.anchor_message_id:
                 continue
-            if message.get("content_sha256") != plan.anchor_sha256:
+            if not anchor_matches(plan, message, archive_root=archive_root):
                 raise ChatGPTIncrementalError(
                     f"anchor hash mismatch: {plan.thread_id}"
                 )
@@ -264,8 +270,13 @@ def page_is_terminal(plan: ThreadPlan, page: dict[str, Any]) -> bool:
     return page.get("has_more") is False
 
 
-def next_cursor(plan: ThreadPlan, page: dict[str, Any]) -> str | None:
-    if page_is_terminal(plan, page):
+def next_cursor(
+    plan: ThreadPlan,
+    page: dict[str, Any],
+    *,
+    archive_root: Path | None = None,
+) -> str | None:
+    if page_is_terminal(plan, page, archive_root=archive_root):
         return None
     if page.get("has_more") is not True:
         raise ChatGPTIncrementalError(f"anchor not found: {plan.thread_id}")

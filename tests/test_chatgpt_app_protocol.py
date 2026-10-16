@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 
+import pytest
+
+from ai_session_export.archive import content_sha256
 from ai_session_export.chatgpt_app_protocol import (
     archive_thread_request,
     discovery_request,
@@ -12,7 +16,13 @@ from ai_session_export.chatgpt_app_protocol import (
     page_request,
     parse_archive_ack,
 )
-from ai_session_export.chatgpt_incremental import ThreadPlan
+from ai_session_export.chatgpt_incremental import (
+    ChatGPTIncrementalError,
+    ThreadPlan,
+    collect_incremental_tail,
+)
+from ai_session_export.markdown import render_markdown
+from ai_session_export.models import MessageTurn, SessionRecord
 
 
 def _plan(mode: str = "incremental_tail") -> ThreadPlan:
@@ -172,3 +182,67 @@ def test_new_thread_continues_until_end() -> None:
     }
     assert page_is_terminal(plan, page) is False
     assert next_cursor(plan, page) == "cursor-2"
+
+
+def test_citation_rendering_change_preserves_anchor_proof(tmp_path) -> None:
+    archived_text = "Source \ue200cite\ue202turn1search0\ue201 and \ue200cite\ue202turn1search1\ue201."
+    observed_text = (
+        'Source :chatgpt-content-reference{index="1"} and '
+        ':chatgpt-content-reference{index="2"}.'
+    )
+    archive = tmp_path / "approved" / "thread.md"
+    archive.parent.mkdir()
+    archive.write_text(
+        render_markdown(
+            SessionRecord(
+                "chatgpt", "thread-1", "Title", "2026-10-05",
+                [MessageTurn("assistant", archived_text, message_id="assistant-anchor")],
+            )
+        ),
+        encoding="utf-8",
+    )
+    plan = replace(
+        _plan(),
+        anchor_message_id="assistant-anchor",
+        anchor_sha256=content_sha256(archived_text),
+        output_file="approved/thread.md",
+    )
+    page = {
+        "thread_id": "thread-1",
+        "cursor_in": None,
+        "cursor_out": "older",
+        "has_more": True,
+        "messages": [{
+            "id": "assistant-anchor",
+            "role": "assistant",
+            "content": observed_text,
+            "content_sha256": content_sha256(observed_text),
+            "complete": True,
+        }],
+    }
+
+    assert page_is_terminal(plan, page, archive_root=tmp_path) is True
+    assert next_cursor(plan, page, archive_root=tmp_path) is None
+    tail = collect_incremental_tail(plan, lambda _thread, _cursor: page,
+                                    archive_root=tmp_path)
+    assert tail.terminal_reason == "anchor"
+    assert tail.messages == []
+
+    changed = dict(page)
+    changed["messages"] = [{
+        **page["messages"][0],
+        "content": observed_text.replace("Source", "Different source"),
+        "content_sha256": content_sha256(
+            observed_text.replace("Source", "Different source")
+        ),
+    }]
+    with pytest.raises(ChatGPTIncrementalError, match="anchor hash mismatch"):
+        page_is_terminal(plan, changed, archive_root=tmp_path)
+    with pytest.raises(ChatGPTIncrementalError, match="anchor hash mismatch"):
+        collect_incremental_tail(plan, lambda _thread, _cursor: changed,
+                                 archive_root=tmp_path)
+
+    with pytest.raises(ChatGPTIncrementalError, match="anchor hash mismatch"):
+        page_is_terminal(plan, page)
+    with pytest.raises(ChatGPTIncrementalError, match="anchor hash mismatch"):
+        page_is_terminal(plan, page, archive_root=tmp_path / "missing")

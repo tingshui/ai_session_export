@@ -1,5 +1,15 @@
 ## Changelog
 
+### 2026-10-05 — ChatGPT citation rendering anchor compatibility
+
+- Scheduled incremental reads now accept an existing assistant anchor when the
+  archived private-use citation tokens and App content-reference placeholders
+  split the message into exactly the same non-citation text segments. The
+  archive must parse successfully and its anchor hash must still match the
+  checkpoint. Any body edit, missing archive, or other markup change still
+  fails closed. The controller and apply path use the same check; no checkpoint
+  reset or archive rewrite is needed to recognize the prior anchor.
+
 ### 2026-09-08 — Isolated ChatGPT checkpoint ownership
 
 - Added strict ChatGPT-only checkpoint I/O and a dry-run-first state splitter:
@@ -128,6 +138,10 @@
 - Added `docs/` with `prd.md`, `rfc.md`, `test.md`, and this file.
 
 ## Lessons Learned
+
+- ChatGPT App presentation of old citations can change while the prose is
+  byte-identical. Anchor verification must compare the prior verified archive
+  with the current rendering before treating a citation-only change as an edit.
 
 - **A product family is not one incremental domain.** Antigravity 2.0, IDE, and CLI use related transcript formats but write independently. A shared maximum timestamp can suppress unseen sessions from another surface; state must be scoped by surface and session.
 - **A parse failure is state, not just an exception.** Continuing past one bad transcript is necessary, but marking a partial session complete would make the data loss permanent. Failed fingerprints stay retryable and make cron report partial success explicitly.

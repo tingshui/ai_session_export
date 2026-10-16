@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from zoneinfo import ZoneInfo
 import re
 from datetime import date
 from pathlib import Path
@@ -69,6 +71,7 @@ def parse_codex_session_file(file_path: Path, titles: dict[str, str]) -> ParsedC
     current_model: str | None = None
     pending_user_turns: list[int] = []
     first_user_text = ""
+    export_timezone = ZoneInfo(os.environ["CODEX_EXPORT_TIMEZONE"]) if os.environ.get("CODEX_EXPORT_TIMEZONE") else None
     started_at: date | None = None
     latest_timestamp_ms = 0
 
@@ -86,7 +89,7 @@ def parse_codex_session_file(file_path: Path, titles: dict[str, str]) -> ParsedC
                 event_ts_ms = int(timestamp.timestamp() * 1000)
                 latest_timestamp_ms = max(latest_timestamp_ms, event_ts_ms)
                 if started_at is None:
-                    started_at = timestamp.date()
+                    started_at = timestamp.astimezone(export_timezone).date() if export_timezone else timestamp.date()
 
             event_type = event.get("type")
             payload = event.get("payload") or {}
@@ -175,7 +178,7 @@ def export_codex(
     for file_path in session_files:
         scanned += 1
         path_date = _date_from_path(file_path)
-        if since_date and path_date and path_date < since_date:
+        if since_date and path_date and path_date < since_date and not os.environ.get("CODEX_EXPORT_TIMEZONE"):
             continue
         path_session_id = _session_id_from_path(file_path)
         path_state = session_state.get(path_session_id, {})

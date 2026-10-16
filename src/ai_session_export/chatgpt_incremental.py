@@ -23,6 +23,8 @@ TRUNCATION_SENTINEL_RE = re.compile(
     r"(?:…|\.{3})\s*\d+\s+tokens?\s+truncated\s*(?:…|\.{3})",
     re.IGNORECASE,
 )
+ARCHIVED_CITATION_RE = re.compile(r"\ue200cite\ue202[^\ue200\ue201\n]+\ue201")
+APP_CITATION_RE = re.compile(r':chatgpt-content-reference\{index="[0-9]+"\}')
 
 
 class ChatGPTIncrementalError(RuntimeError):
@@ -227,6 +229,50 @@ def _anchor(session_state: dict[str, Any]) -> tuple[str | None, str | None]:
         if message_id and re.fullmatch(r"[0-9a-f]{64}", digest):
             return message_id, digest
     return None, None
+
+
+def _citation_text_matches(archived: str, observed: str) -> bool:
+    """Recognize only the two known App renderings of assistant citations."""
+
+    archived_parts = ARCHIVED_CITATION_RE.split(archived)
+    observed_parts = APP_CITATION_RE.split(observed)
+    return len(archived_parts) > 1 and archived_parts == observed_parts
+
+
+def anchor_matches(
+    plan: ThreadPlan,
+    item: dict[str, Any],
+    *,
+    archive_root: Path | None = None,
+) -> bool:
+    """Verify an exact anchor, or a citation-only App rendering change."""
+
+    observed_hash = str(item.get("content_sha256") or "")
+    if observed_hash == plan.anchor_sha256:
+        return True
+    content = item.get("content")
+    if (
+        archive_root is None
+        or item.get("role") != "assistant"
+        or not isinstance(content, str)
+        or not plan.output_file
+        or not plan.anchor_message_id
+        or not plan.anchor_sha256
+    ):
+        return False
+    try:
+        archived = parse_marked_markdown(
+            _archive_path(archive_root, plan.output_file)
+        )
+    except (ChatGPTIncrementalError, OSError, ValueError):
+        return False
+    matching = [turn for turn in archived if turn.message_id == plan.anchor_message_id]
+    return (
+        len(matching) == 1
+        and matching[0].role == "assistant"
+        and matching[0].content_sha256 == plan.anchor_sha256
+        and _citation_text_matches(matching[0].content, content)
+    )
 
 
 def plan_incremental_threads(
@@ -471,6 +517,8 @@ def _message_from_summary(item: dict[str, Any]) -> MessageTurn:
 def collect_incremental_tail(
     plan: ThreadPlan,
     read_page: Callable[[str, str | None], dict[str, Any]],
+    *,
+    archive_root: Path | None = None,
 ) -> CollectedTail:
     """Read newest-first pages until the prior message anchor is proven."""
 
@@ -491,8 +539,9 @@ def collect_incremental_tail(
                 raise ChatGPTIncrementalError(f"page contains non-object message: {plan.thread_id}")
             message = _message_from_summary(item)
             if message.message_id == plan.anchor_message_id:
-                observed_hash = str(item.get("content_sha256") or content_sha256(message.content))
-                if observed_hash != plan.anchor_sha256:
+                anchor_item = dict(item)
+                anchor_item.setdefault("content_sha256", content_sha256(message.content))
+                if not anchor_matches(plan, anchor_item, archive_root=archive_root):
                     raise ChatGPTIncrementalError(f"anchor hash mismatch: {plan.thread_id}")
                 return CollectedTail(list(reversed(newest_first)), pages_read, "anchor")
             newest_first.append(message)
@@ -1088,7 +1137,9 @@ def apply_incremental_payload(
             tail = (
                 collect_window_tail(plan, read_page, since_at=window_since_at)
                 if window_since_at is not None
-                else collect_incremental_tail(plan, read_page)
+                else collect_incremental_tail(
+                    plan, read_page, archive_root=output_dir
+                )
             )
             if page_index != len(raw_pages):
                 raise ChatGPTIncrementalError(f"page chain continues past terminal proof: {plan.thread_id}")
